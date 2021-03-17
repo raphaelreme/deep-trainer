@@ -198,7 +198,7 @@ class PytorchTrainer:
             progress = tqdm.tqdm(dataloader)
             progress.set_description_str(self.test_description.format(loss=loss))
             for batch in progress:
-                inputs, targets, batch_size = self.process_test_batch(batch)
+                inputs, targets, batch_size = self.process_eval_batch(batch)
                 predictions = self.model(inputs)
                 loss = criterion(predictions, targets).item()
 
