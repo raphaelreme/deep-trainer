@@ -1,13 +1,18 @@
+"""Provide the Trainer Class for PyTorch."""
+
 import os
+from typing import List
 
 import torch
+import torch.utils.tensorboard
 import tqdm
 
 
 # TODO: Log instead of print for epochs + time monitoring
 # TODO: Add scheduler ?
 # TODO: Load/save
-# TODO: API to access registered losses and display them ?
+# TODO: Use tensorboard in a better way + Add metrics ?
+# TODO: Time info for epochs. (Split data time vs Model time ?)
 
 
 class PytorchTrainer:
@@ -15,10 +20,12 @@ class PytorchTrainer:
 
     Wraps all the training procedures for a given model and optimizer.
     """
+
     train_description = "Training --- loss: {loss:.3f}"
     test_description = "Testing --- loss: {loss:.3f}"
-    epoch_description = "Epoch {epoch} --- Avg train loss: {train_loss:.3f} Avg val loss: {val_loss:.3f} " \
-                    + "[{step}/{total_step}]\n" # TODO: time info for epochs
+    epoch_description = (
+        "Epoch {epoch} --- Avg train loss: {train_loss:.3f} Avg val loss: {val_loss:.3f} [{step}/{total_step}]\n"
+    )
 
     def __init__(self, model, optimizer, device, exp_dir="./experiments", save_mode="never") -> None:
         """Constructor
@@ -30,20 +37,23 @@ class PytorchTrainer:
             exp_dir (str): Experiment directory, where checkpoints are saved
             save_mode ("never"|"always"|"best"): When to do checkpoints.
                 never: No checkpoints are made for this training
-                best: A checkpoint is made each time the validation loss improves
-                always: A checkpoint is made after each epochs
+                best: Keep only the best checkpoint
+                all: A checkpoint is made for each epochs
         """
         self.model = model
         self.optimizer = optimizer
         self.device = device
         self.exp_dir = exp_dir
         self.save_mode = save_mode
+        self.tensorboard_writer = torch.utils.tensorboard.SummaryWriter(log_dir=exp_dir)
 
         os.makedirs(self.exp_dir, exist_ok=True)
         self.epoch = 0
         self.best_val = float("inf")
         self.best_epoch = -1
-        self.losses = torch.zeros((2, 0))
+
+        self.train_losses: List[float] = []
+        self.val_losses: List[float] = []
 
     def _default_process_batch(self, batch):
         inputs, targets = batch
@@ -90,11 +100,15 @@ class PytorchTrainer:
         """Backpropagation step given the loss
 
         Args:
-            loss (torch.tensor)
+            loss (torch.Tensor)
+
+        Returns:
+            loss (torch.Tensor)
         """
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        return loss
 
     def train(self, epochs, train_loader, criterion, val_loader=None, val_criterion=None, epoch_size=0):
         """Train the model
@@ -115,6 +129,7 @@ class PytorchTrainer:
             Trainer: self
         """
         n_epochs = self.epoch + epochs
+        n_steps = 0
 
         if val_criterion is None:
             val_criterion = criterion
@@ -122,21 +137,17 @@ class PytorchTrainer:
         if epoch_size == 0:
             epoch_size = len(train_loader)
 
-        losses = torch.zeros((2, n_epochs))
-        losses[:, :self.epoch] = self.losses[:, :self.epoch]
-        self.losses = losses
-
         train_iterator = iter(train_loader)
-
         while self.epoch < n_epochs:
             self.model.train()
-            N = 0
+            n_samples = 0
             epoch_loss = 0.0
             loss = float("nan")
 
             progress = tqdm.trange(epoch_size)
             progress.set_description_str(self.train_description.format(loss=loss))
             for _ in progress:
+                n_steps += 1
                 try:
                     batch = next(train_iterator)
                 except StopIteration:
@@ -145,39 +156,40 @@ class PytorchTrainer:
 
                 inputs, targets, batch_size = self.process_train_batch(batch)
                 predictions = self.model(inputs)
-                loss = criterion(predictions, targets)
-                self.backward(loss)
+                loss = self.backward(criterion(predictions, targets)).item()
 
-                loss = loss.item()
-                N += batch_size
+                self.train_losses.append(loss)
+                self.tensorboard_writer.add_scalar("Training loss", loss, n_steps)
+                n_samples += batch_size
                 epoch_loss += loss * batch_size
 
                 progress.set_description_str(self.train_description.format(loss=loss))
 
             if val_loader is None:
-                val_loss = float("inf")
+                self.val_losses.append(float("inf"))
             else:
-                val_loss = self.evaluate(val_loader, val_criterion)
+                self.val_losses.append(self.evaluate(val_loader, val_criterion))
+                self.tensorboard_writer.add_scalar("Validation loss", self.val_losses[-1], n_steps)
 
-            self.losses[0, self.epoch] = epoch_loss / N
-            self.losses[1, self.epoch] = val_loss
+            print(
+                self.epoch_description.format(
+                    epoch=self.epoch,
+                    train_loss=epoch_loss / n_samples,
+                    val_loss=self.val_losses[-1],
+                    step=self.epoch + 1,
+                    total_step=n_epochs,
+                ),
+                flush=True,
+            )
 
-            print(self.epoch_description.format(
-                epoch=self.epoch,
-                train_loss=epoch_loss / N,
-                val_loss=val_loss,
-                step=self.epoch+1,
-                total_step=n_epochs,
-            ), flush=True)
-
-            if val_loss < self.best_val:
-                self.best_val = val_loss
+            if self.val_losses[-1] < self.best_val:
+                self.best_val = self.val_losses[-1]
                 self.best_epoch = self.epoch
-                if self.save_mode == "best":
-                    self.save()
+                if self.save_mode in ["best", "all"]:
+                    self.save("best.pt")
 
-            if self.save_mode == "always":
-                self.save()
+            if self.save_mode == "all":
+                self.save(f"{self.epoch}.pt")
             self.epoch += 1
 
         return self
@@ -188,10 +200,13 @@ class PytorchTrainer:
         Args:
             dataloader (iterable): Dataloader over the dataset to evaluate
             criterion (callable): Evaluation criterion to use
+
+        Returns:
+            float: Averaged loss
         """
         self.model.eval()
         with torch.no_grad():
-            N = 0
+            n_samples = 0
             cum_loss = 0
             loss = float("nan")
 
@@ -202,16 +217,23 @@ class PytorchTrainer:
                 predictions = self.model(inputs)
                 loss = criterion(predictions, targets).item()
 
-                N += batch_size
+                n_samples += batch_size
                 cum_loss += loss * batch_size
 
                 progress.set_description_str(self.test_description.format(loss=loss))
 
-        return cum_loss / N
+        return cum_loss / n_samples
 
-    def save(self):
-        # Should save also the optimizer !
-        torch.save(self.model.state_dict(), os.path.join(self.exp_dir, f"{self.epoch}.pt"))
+    def save(self, filename):
+        """Save a checkpoint in the experiment directory
+
+        WIP: For now only save the model
+
+        Args:
+            filename (str): Name of the checkpoint file
+        """
+        torch.save(self.model.state_dict(), os.path.join(self.exp_dir, filename))
 
     def load(self, path):
+        """Not implented yet"""
         raise NotImplementedError
