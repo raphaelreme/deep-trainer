@@ -10,11 +10,9 @@ import tqdm
 from . import metric
 
 
-# TODO: Log instead of print for epochs + time monitoring
+# TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?)
 # TODO: Add scheduler ?
 # TODO: Load/save
-# TODO: Add some more stuff to tensorboard ?
-# TODO: Time info for epochs. (Split data time vs Model time ?)
 
 
 def _convert_to_deep_trainer_criterion(criterion: Callable) -> metric.Criterion:
@@ -144,6 +142,7 @@ class PytorchTrainer:
 
         if val_criteria is None:
             val_criteria = [criterion]
+        val_criteria = list(map(_convert_to_deep_trainer_criterion, val_criteria))
 
         train_iterator = iter(train_loader)
         while self.epoch < n_epochs:

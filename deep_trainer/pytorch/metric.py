@@ -71,8 +71,9 @@ class AveragingCriterion(Criterion):
 
     def update(self, predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         loss = self.loss_function(predictions, labels)
-        self._sum += loss.item()
-        self._n_samples += labels.shape[0]
+        batch_size = labels.shape[0]
+        self._sum += loss.item() * batch_size
+        self._n_samples += batch_size
         return loss
 
     def aggregate(self) -> float:
@@ -91,7 +92,7 @@ class Accuracy(AveragingCriterion):
     """
 
     def __init__(self):
-        super().__init__(self._compute)
+        super().__init__(self._compute, "Accuracy")
 
     @staticmethod
     def _compute(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -106,7 +107,7 @@ class Error(AveragingCriterion):
     """
 
     def __init__(self):
-        super().__init__(self._compute)
+        super().__init__(self._compute, "Error")
 
     @staticmethod
     def _compute(predictions: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
