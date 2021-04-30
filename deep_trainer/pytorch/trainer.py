@@ -1,18 +1,20 @@
 """Provide the Trainer Class for PyTorch."""
 
 import os
+import pathlib
 from typing import Callable, Dict, List
 
 import torch
 import torch.utils.tensorboard
-import tqdm
+import tqdm  # type: ignore
 
 from . import metric
 
 
-# TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?)
+# TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?
 # TODO: Add scheduler ?
 # TODO: Load/save
+# TODO: Redirect stdout to logfile and stdout ?
 
 
 def _convert_to_deep_trainer_criterion(criterion: Callable) -> metric.Criterion:
@@ -33,27 +35,29 @@ class PytorchTrainer:
         "Epoch {epoch} --- Avg train loss: {train_loss:.3f} Avg val loss: {val_loss:.3f} [{step}/{total_step}]\n"
     )
 
-    def __init__(self, model, optimizer, device, exp_dir="./experiments", save_mode="never"):
+    def __init__(self, model, optimizer, device, output_dir="./experiments", save_mode="never"):
         """Constructor
 
         Args:
             model (nn.Module): The model to be trained
             optimizer (nn.Optimizer): Optimizer to use
             device (torch.device): Device of the model
-            exp_dir (str): Experiment directory, where checkpoints are saved
+            output_dir (Union[str, PathLike]): output directory, where checkpoints, logs, [...] are saved
             save_mode ("never"|"always"|"best"): When to do checkpoints.
-                never: No checkpoints are made for this training
+                never: No checkpoint for this training
                 best: Keep only the best checkpoint
                 all: A checkpoint is made for each epochs
         """
         self.model = model
         self.optimizer = optimizer
         self.device = device
-        self.exp_dir = exp_dir
-        self.save_mode = save_mode
-        self.tensorboard_writer = torch.utils.tensorboard.SummaryWriter(log_dir=exp_dir)
 
-        os.makedirs(self.exp_dir, exist_ok=True)
+        self.output_dir = pathlib.Path(output_dir)
+        self.save_mode = save_mode
+        os.makedirs(self.output_dir / "tensorboard", exist_ok=True)
+        os.makedirs(self.output_dir / "checkpoints", exist_ok=True)
+        self.tensorboard_writer = torch.utils.tensorboard.SummaryWriter(log_dir=self.output_dir / "tensorboard")
+
         self.train_steps = 0
         self.epoch = 0
         self.best_val = float("inf")
@@ -237,19 +241,19 @@ class PytorchTrainer:
                 for criterion in reversed(criteria):
                     loss = criterion(predictions, targets).item()
 
-                progress.set_description_str(self.test_description.format(loss=loss))
+                progress.set_description_str(self.test_description.format(loss=loss))  # Display first criterion only
 
         return {criterion.name: criterion.aggregate() for criterion in criteria}
 
     def save(self, filename):
-        """Save a checkpoint in the experiment directory
+        """Save a checkpoint in the output directory
 
         WIP: For now only save the model
 
         Args:
-            filename (str): Name of the checkpoint file
+            filename (Union[str, PathLike]): Name of the checkpoint file
         """
-        torch.save(self.model.state_dict(), os.path.join(self.exp_dir, filename))
+        torch.save(self.model.state_dict(), self.output_dir / "checkpoints" / filename)
 
     def load(self, path):
         """Not implented yet"""
