@@ -117,6 +117,27 @@ class PytorchTrainer:
         self.optimizer.step()
         return loss
 
+    def train_step(self, batch, criterion):
+        """Perform a training step.
+
+        Can be overwritten for special behaviors.
+
+        Args:
+            batch (Any): The batch from the train loader
+            criterion (Callable): Loss function given to the train function.
+                See `PytorchTrainer.train` documentation.
+
+        Returns:
+            float: The loss
+        """
+        inputs, targets = self.process_train_batch(batch)
+
+        predictions = self.model(inputs)
+        loss = criterion(predictions, targets)
+        self.backward(loss)
+
+        return loss.item()
+
     def train(self, epochs, train_loader, criterion, val_loader=None, val_criteria=None, epoch_size=0):
         """Train the model
 
@@ -162,13 +183,10 @@ class PytorchTrainer:
                     train_iterator = iter(train_loader)
                     batch = next(train_iterator)
 
-                inputs, targets = self.process_train_batch(batch)
-                predictions = self.model(inputs)
-                loss = self.backward(criterion(predictions, targets)).item()
+                loss = self.train_step(batch, criterion)
 
                 self.train_losses.append(loss)
                 self.tensorboard_writer.add_scalar("Training loss", loss, self.train_steps)
-
                 progress.set_description_str(self.train_description.format(loss=loss))
                 self.train_steps += 1
 
