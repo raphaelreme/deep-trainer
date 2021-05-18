@@ -11,10 +11,9 @@ import tqdm  # type: ignore
 from . import metric
 
 
-# TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?
+# TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?)
 # TODO: Add scheduler ?
 # TODO: Load/save
-# TODO: Redirect stdout to logfile and stdout ?
 
 
 def _convert_to_deep_trainer_criterion(criterion: Callable) -> metric.Criterion:
