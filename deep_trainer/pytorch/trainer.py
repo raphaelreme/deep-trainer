@@ -186,7 +186,7 @@ class PytorchTrainer:
                 loss = self.train_step(batch, criterion)
 
                 self.train_losses.append(loss)
-                self.tensorboard_writer.add_scalar("Training loss", loss, self.train_steps)
+                self.tensorboard_writer.add_scalar("train/Loss", loss, self.train_steps)
                 progress.set_description_str(self.train_description.format(loss=loss))
                 self.train_steps += 1
 
@@ -200,7 +200,7 @@ class PytorchTrainer:
                         self.val_losses[key] = [float("nan")] * self.epoch
                     self.val_losses[key].append(losses.get(key, float("nan")))
 
-                    self.tensorboard_writer.add_scalar(key, self.val_losses[key][-1], self.train_steps)
+                    self.tensorboard_writer.add_scalar(f"val/{key}", self.val_losses[key][-1], self.train_steps)
 
             val_loss = self.val_losses[val_criteria[0].name][-1]
 
