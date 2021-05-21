@@ -34,13 +34,16 @@ class PytorchTrainer:
         "Epoch {epoch} --- Avg train loss: {train_loss:.3f} Avg val loss: {val_loss:.3f} [{step}/{total_step}]\n"
     )
 
-    def __init__(self, model, optimizer, device, output_dir="./experiments", save_mode="never"):
+    def __init__(self, model, optimizer, device, scheduler=None, output_dir="./experiments", save_mode="never"):
         """Constructor
 
         Args:
-            model (nn.Module): The model to be trained
-            optimizer (nn.Optimizer): Optimizer to use
+            model (torch.nn.Module): The model to be trained
+            optimizer (torch.optim.Optimizer): Optimizer to use
             device (torch.device): Device of the model
+            scheduler (torch.optim._LRScheduler): Optional learning rate scheduler.
+                The `step` method is called at each training step. (More reliable than calling it at each epoch,
+                though it can lead to compute epoch-equivalent steps)
             output_dir (Union[str, PathLike]): output directory, where checkpoints, logs, [...] are saved
             save_mode ("never"|"always"|"best"): When to do checkpoints.
                 never: No checkpoint for this training
@@ -49,6 +52,7 @@ class PytorchTrainer:
         """
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.device = device
 
         self.output_dir = pathlib.Path(output_dir)
@@ -128,26 +132,25 @@ class PytorchTrainer:
                 See `PytorchTrainer.train` documentation.
 
         Returns:
-            float: The loss
+            torch.Tensor: The loss on which to backpropagate
         """
         inputs, targets = self.process_train_batch(batch)
 
         predictions = self.model(inputs)
         loss = criterion(predictions, targets)
-        self.backward(loss)
 
-        return loss.item()
+        return loss
 
     def train(self, epochs, train_loader, criterion, val_loader=None, val_criteria=None, epoch_size=0):
         """Train the model
 
         Args:
             epochs (int): Number of epochs to perform (Should be greater than 0)
-            train_loader (iterable): Data loader for the training set
+            train_loader (Iterable): Data loader for the training set
             criterion (callable): Loss function which will be called with the model predictions and the
                 targets for each batch. Should return a singled loss value on which to backpropagate.
                 It should be differentiable.
-            val_loader (iterable): Optional validation data loader. If provided the model will
+            val_loader (Iterable): Optional validation data loader. If provided the model will
                 be evaluate after each epoch with it. If not, the validation loss is define as infinite.
             val_criteria (List[callable]): Optional validation metrics. If not provided, `criterion` will
                 be used. The first one will be used to select the best model which minimizes the criterion.
@@ -183,10 +186,17 @@ class PytorchTrainer:
                     train_iterator = iter(train_loader)
                     batch = next(train_iterator)
 
-                loss = self.train_step(batch, criterion)
+                loss = self.backward(self.train_step(batch, criterion)).item()
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
                 self.train_losses.append(loss)
+
                 self.tensorboard_writer.add_scalar("train/Loss", loss, self.train_steps)
+                for i, group in enumerate(self.optimizer.param_groups):
+                    self.tensorboard_writer.add_scalar(f"lr/{i}", group["lr"], self.train_steps)
+
                 progress.set_description_str(self.train_description.format(loss=loss))
                 self.train_steps += 1
 
@@ -232,7 +242,7 @@ class PytorchTrainer:
         """Evaluate the current model on several criteria
 
         Args:
-            dataloader (iterable): Dataloader over the dataset to evaluate
+            dataloader (Iterable): Dataloader over the dataset to evaluate
             criteria (List[callable]): Evaluation criterion to use
 
         Returns:
