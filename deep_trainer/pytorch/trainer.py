@@ -1,81 +1,134 @@
 """Provide the Trainer Class for PyTorch."""
 
+import math
 import os
-import pathlib
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, Tuple
 
 import torch
-import torch.utils.tensorboard
+import torch.utils.data
 import tqdm  # type: ignore
 
+from . import logging
 from . import metric
 
 
+# TODO: Avg Losses assume that the batches are evenly sized. (was solved before but not anymore)
 # TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?)
-# TODO: Add scheduler ?
-# TODO: Load/save
 
 
-def _convert_to_deep_trainer_criterion(criterion: Callable) -> metric.Criterion:
-    if not isinstance(criterion, metric.Criterion):
-        return metric.AveragingCriterion(criterion)
-    return criterion
+def round_to_n(x: float, n_digits: int) -> float:
+    """Round a floating point to n significant digits
+
+        Args:
+            x (float): Number to round
+            n_digits (int): Number of digits to keep
+
+        Returns:
+            float: Rounded version of x with n_digits digits
+        """
+    if not math.isfinite(x) or x == 0:
+        return x
+    main_digit = math.floor(math.log10(abs(x)))
+    return round(x, -main_digit + n_digits - 1)
+
+
+def build_description(name: str, metrics: Dict[str, float]) -> str:
+    """Create a description string from a name and some metrics
+
+    Args:
+        name (str): Main name of the description
+        metrics (Dict[str, float]): Metrics to print
+
+    Returns:
+        str: "{name} --- {metric_name}: {metric_value}, ..., {metric_name}: {metric_value}"
+    """
+    desc = name
+
+    if metrics:
+        desc += " --- "
+
+        for metric_name in metrics:
+            desc += f"{metric_name}: {round_to_n(metrics[metric_name], 4):7}, "
+        desc = desc[:-2]
+
+    return desc
 
 
 class PytorchTrainer:
     """Base trainer for pytorch project.
 
-    Wraps all the training procedures for a given model and optimizer.
+    Wraps all the training procedures for a given model, optimizer and scheduler.
     """
 
-    train_description = "Training --- loss: {loss:.3f}"
-    test_description = "Testing --- loss: {loss:.3f}"
-    epoch_description = (
-        "Epoch {epoch} --- Avg train loss: {train_loss:.3f} Avg val loss: {val_loss:.3f} [{step}/{total_step}]\n"
-    )
+    epoch_description = "{desc} [{step}/{total_step}]\n"
 
-    def __init__(self, model, optimizer, device, scheduler=None, output_dir="./experiments", save_mode="never"):
-        """Constructor
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+        metrics_handler: metric.MetricsHandler = None,
+        device: torch.device = None,
+        output_dir: str = "./experiments",
+        save_mode: str = "never",
+    ):
+        """Constructor.
+
+        The model is sent to the device even though this should probably be done before
+
+        By default there is a logger that will save all training metrics to tensorboard.
+        You can overwrite this by assigning a new logger to `trainer.logger`. (For instance a DictLogger
+        that will keep the metrics in Ram so that you can draw your own curves.)
 
         Args:
             model (torch.nn.Module): The model to be trained
             optimizer (torch.optim.Optimizer): Optimizer to use
-            device (torch.device): Device of the model
-            scheduler (torch.optim._LRScheduler): Optional learning rate scheduler.
+            scheduler (torch.optim.lr_scheduler._LRScheduler): Optional learning rate scheduler.
                 The `step` method is called at each training step. (More reliable than calling it at each epoch,
-                though it can lead to compute epoch-equivalent steps)
-            output_dir (Union[str, PathLike]): output directory, where checkpoints, logs, [...] are saved
-            save_mode ("never"|"always"|"best"): When to do checkpoints.
+                though it can lead to compute epoch-equivalent steps).
+                Default: None
+            metrics_handler (metric.MetricdHandler): Handle a list of metrics to track.
+                See the documentation of `Metric` for more info.
+                In addition of those metrics, the `train` and `evaluate` method expect a criterion to compute
+                a loss. (the training one should be differentiable unless you do your own backpropagation)
+            device (torch.device): Torch device to use. If None, the default device will be cuda:0
+                (or cpu if cuda is not available)
+                TPU or Multi device training is not supported yet.
+            output_dir (str): output directory, where checkpoints, logs, [...] are saved
+            save_mode ("never"|"small"|"all"): Checkpointing mode (see `save` and `load`)
                 never: No checkpoint for this training
-                best: Keep only the best checkpoint
-                all: A checkpoint is made for each epochs
+                small: Keep only the best checkpoint 'best.ckpt' and the last checkpoint
+                       '{epoch}.ckpt' (automatically clean the previous ones)
+                all  : Keep everything. '{epoch}.ckpt' for each epoch and 'best.ckpt'
         """
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.metrics_handler = metrics_handler if metrics_handler else metric.MetricsHandler([])
         self.device = device
-
-        self.output_dir = pathlib.Path(output_dir)
+        self.output_dir = output_dir
         self.save_mode = save_mode
-        os.makedirs(self.output_dir / "tensorboard", exist_ok=True)
-        os.makedirs(self.output_dir / "checkpoints", exist_ok=True)
-        self.tensorboard_writer = torch.utils.tensorboard.SummaryWriter(log_dir=self.output_dir / "tensorboard")
+
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+
+        os.makedirs(os.path.join(self.output_dir, "checkpoints"), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, "logs"), exist_ok=True)
+        self.logger = logging.TensorBoardLogger(os.path.join(self.output_dir, "logs"))
 
         self.train_steps = 0
         self.epoch = 0
         self.best_val = float("inf")
         self.best_epoch = -1
 
-        self.train_losses: List[float] = []
-        self.val_losses: Dict[str, List[float]] = {}
-
-    def _default_process_batch(self, batch):
+    def _default_process_batch(self, batch: Any) -> Tuple[Any, Any]:
         inputs, targets = batch
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         return inputs, targets
 
-    def process_train_batch(self, batch):
+    def process_train_batch(self, batch: Any) -> Tuple[Any, Any]:
         """Process each training batch.
 
         Extract inputs for the model, targets for the loss, and batch size.
@@ -91,7 +144,7 @@ class PytorchTrainer:
         """
         return self._default_process_batch(batch)
 
-    def process_eval_batch(self, batch):
+    def process_eval_batch(self, batch: Any) -> Tuple[Any, Any]:
         """Process each eval batch.
 
         Extract inputs for the model, targets for the loss, and batch size.
@@ -107,53 +160,97 @@ class PytorchTrainer:
         """
         return self._default_process_batch(batch)
 
-    def backward(self, loss):
+    def backward(self, loss: torch.Tensor):
         """Backpropagation step given the loss
 
-        Args:
-            loss (torch.Tensor)
+        Should be overwritten for special backpropagation / optimizer behavior.
 
-        Returns:
+        Args:
             loss (torch.Tensor)
         """
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        return loss
 
-    def train_step(self, batch, criterion):
+    def train_step(self, batch: Any, criterion: Callable) -> Dict[str, float]:
         """Perform a training step.
 
-        Can be overwritten for special behaviors.
+        Should be overwritten for special behaviors. The steps are:
+            - Processing the batch from the train dataloader (By default: `PytorchTrainer.process_train_batch`)
+            - Compute model outputs (By default: `self.model(inputs)`)
+            - Compute loss and update metrics (if needed) using the criterion and the metrics_handler
+            - Backward as needed (By default: `PytorchTrainer.backward`)
+            - Optional step for the scheduler (Done by default)
 
         Args:
             batch (Any): The batch from the train loader
-            criterion (Callable): Loss function given to the train function.
+            criterion (Callable): Loss function given to the train method.
                 See `PytorchTrainer.train` documentation.
 
         Returns:
-            torch.Tensor: The loss on which to backpropagate
+            Dict[str, float]: Evaluation of metrics on this batch
+                Should contain a "Loss" entry.
+                All the items (one by metric by default), will be logged
         """
         inputs, targets = self.process_train_batch(batch)
-
         predictions = self.model(inputs)
-        loss = criterion(predictions, targets)
 
-        return loss
+        self.metrics_handler.update(predictions, targets)
+        loss: torch.Tensor = criterion(predictions, targets)
 
-    def train(self, epochs, train_loader, criterion, val_loader=None, val_criteria=None, epoch_size=0):
+        self.backward(loss)
+        if self.scheduler:
+            self.scheduler.step()
+
+        metrics = self.metrics_handler.last_values
+        metrics["Loss"] = loss.item()
+
+        return metrics
+
+    def eval_step(self, batch: Any, criterion: Callable) -> Dict[str, float]:
+        """Perform a evaluation step.
+
+        Args:
+            batch (Any): Batch from the dataloader given to evaluate
+            criterion (Callable): Loss function given to the evaluate method.
+                See `PytorchTrainer.evaluate` documentation.
+
+        Returns:
+            Dict[str, float]: Evaluation of the metrics on this batch
+                Should contain a "Loss" entry
+        """
+        inputs, targets = self.process_eval_batch(batch)
+        predictions = self.model(inputs)
+
+        self.metrics_handler.update(predictions, targets)
+        loss: torch.Tensor = criterion(predictions, targets)
+
+        metrics = self.metrics_handler.last_values
+        metrics["Loss"] = loss.item()
+
+        return metrics
+
+    def train(
+        self,
+        epochs: int,
+        train_loader: torch.utils.data.DataLoader,
+        criterion: Callable,
+        val_loader: torch.utils.data.DataLoader = None,
+        val_criterion: Callable = None,
+        epoch_size: int = 0,
+    ) -> "PytorchTrainer":
         """Train the model
 
         Args:
             epochs (int): Number of epochs to perform (Should be greater than 0)
-            train_loader (Iterable): Data loader for the training set
-            criterion (callable): Loss function which will be called with the model predictions and the
+            train_loader (torch.utils.data.Dataloader): Data loader for the training set
+            criterion (Callable): Loss function which will be called with the model outputs and the
                 targets for each batch. Should return a singled loss value on which to backpropagate.
                 It should be differentiable.
-            val_loader (Iterable): Optional validation data loader. If provided the model will
-                be evaluate after each epoch with it. If not, the validation loss is define as infinite.
-            val_criteria (List[callable]): Optional validation metrics. If not provided, `criterion` will
-                be used. The first one will be used to select the best model which minimizes the criterion.
+            val_loader (torch.utils.data.Dataloader): Optional validation data loader. If provided the
+                model will be evaluate after each epoch with it. If not, no validation is done.
+            val_criterion (Callable): Optional validation criterion. Used to compute a validation loss on the
+                val_loader. It not given, criterion will be used instead.
             epoch_size (int): The number of training steps for each epochs.
                 By default the length of the train_loader is used.
 
@@ -165,123 +262,152 @@ class PytorchTrainer:
         if epoch_size == 0:
             epoch_size = len(train_loader)
 
-        criterion = _convert_to_deep_trainer_criterion(criterion)
-
-        if val_criteria is None:
-            val_criteria = [criterion]
-        val_criteria = list(map(_convert_to_deep_trainer_criterion, val_criteria))
+        if val_criterion is None:
+            val_criterion = criterion
 
         train_iterator = iter(train_loader)
         while self.epoch < n_epochs:
             self.model.train()
-            loss = float("nan")
-            criterion.reset()
+            self.metrics_handler.train()
+            self.metrics_handler.reset()
+            loss_cum = 0.0
+            metrics = self.metrics_handler.last_values
+            metrics["Loss"] = float("nan")
 
-            progress = tqdm.trange(epoch_size)
-            progress.set_description_str(self.train_description.format(loss=loss))
-            for _ in progress:
+            progress_bar = tqdm.trange(epoch_size)
+            progress_bar.set_description(build_description("Training", metrics))
+            for _ in progress_bar:
                 try:
                     batch = next(train_iterator)
                 except StopIteration:
                     train_iterator = iter(train_loader)
                     batch = next(train_iterator)
 
-                loss = self.backward(self.train_step(batch, criterion)).item()
+                metrics = self.train_step(batch, criterion)
+                loss_cum += metrics["Loss"]
 
-                if self.scheduler is not None:
-                    self.scheduler.step()
+                for metric_name in metrics:
+                    self.logger.log(f"train/{metric_name}", metrics[metric_name], self.train_steps)
 
-                self.train_losses.append(loss)
-
-                self.tensorboard_writer.add_scalar("train/Loss", loss, self.train_steps)
                 for i, group in enumerate(self.optimizer.param_groups):
-                    self.tensorboard_writer.add_scalar(f"lr/{i}", group["lr"], self.train_steps)
+                    self.logger.log(f"lr/group_{i}", group["lr"], self.train_steps)
 
-                progress.set_description_str(self.train_description.format(loss=loss))
+                progress_bar.set_description(build_description("Training", metrics))
                 self.train_steps += 1
 
-            if val_loader is None:
-                for key in self.val_losses:
-                    self.val_losses[key].append(float("nan"))
-            else:
-                losses = self.evaluate(val_loader, val_criteria)
-                for key in set(losses).union(self.val_losses):
-                    if key not in self.val_losses:
-                        self.val_losses[key] = [float("nan")] * self.epoch
-                    self.val_losses[key].append(losses.get(key, float("nan")))
-
-                    self.tensorboard_writer.add_scalar(f"val/{key}", self.val_losses[key][-1], self.train_steps)
-
-            val_loss = self.val_losses[val_criteria[0].name][-1]
-
-            print(
-                self.epoch_description.format(
-                    epoch=self.epoch,
-                    train_loss=criterion.aggregate(),
-                    val_loss=val_loss,
-                    step=self.epoch + 1,
-                    total_step=n_epochs,
-                ),
-                flush=True,
-            )
-
-            if val_loss < self.best_val:
-                self.best_val = val_loss
-                self.best_epoch = self.epoch
-                if self.save_mode in ["best", "all"]:
-                    self.save("best.pt")
-
-            if self.save_mode == "all":
-                self.save(f"{self.epoch}.pt")
-
+            metrics = self.metrics_handler.aggregated_values
             self.epoch += 1
+
+            if self.save_mode != "never":
+                self.save(f"{self.epoch}.ckpt")
+
+                if self.save_mode == "small":
+                    self._clean_checkpoints()
+
+            if val_loader is not None:
+                metrics = self.evaluate(val_loader, val_criterion)
+                for metric_name in metrics:
+                    self.logger.log(f"val/{metric_name}", metrics[metric_name], self.train_steps)
+
+                if metrics["Loss"] < self.best_val:
+                    self.best_val = metrics["Loss"]
+                    self.best_epoch = self.epoch
+                    if self.save_mode != "never":
+                        self.save("best.ckpt")
+
+                metrics["Avg Val Loss"] = metrics.pop("Loss")  # Rename Loss
+
+            # Use val metrics if possible (and only the avg train loss from train loop)
+            metrics["Avg Train Loss"] = loss_cum / epoch_size  # Assume that batch are evenly sized
+            print(build_description(f"Epoch {self.epoch}/{n_epochs}", metrics), end="\n\n", flush=True)
 
         return self
 
-    def evaluate(self, dataloader, criteria):
-        """Evaluate the current model on several criteria
+    def evaluate(self, dataloader: torch.utils.data.DataLoader, criterion: Callable) -> Dict[str, float]:
+        """Evaluate the current model with the metrics on the dataloader
 
         Args:
-            dataloader (Iterable): Dataloader over the dataset to evaluate
-            criteria (List[callable]): Evaluation criterion to use
+            dataloader (torch.utils.data.Dataloader): Dataloader over the dataset to evaluate
+            criterion (Callable): Main criterion of the evaluation. Should be minimized.
 
         Returns:
-            Dict[str, float]: Aggregate loss for each criteria
+            Dict[str, float]: Aggregated metrics
         """
-        if len(criteria) == 0:
-            return []
-
-        criteria = list(map(_convert_to_deep_trainer_criterion, criteria))
-        for criterion in criteria:
-            criterion.reset()
-
         self.model.eval()
+        self.metrics_handler.eval()
+        self.metrics_handler.reset()
+        loss_cum = 0.0
+        metrics = self.metrics_handler.last_values
+        metrics["Loss"] = float("nan")
+
         with torch.no_grad():
-            loss = float("nan")
+            progress_bar = tqdm.tqdm(dataloader)
+            progress_bar.set_description(build_description("Testing", metrics))
+            for batch in progress_bar:
+                metrics = self.eval_step(batch, criterion)
+                loss_cum += metrics["Loss"]
 
-            progress = tqdm.tqdm(dataloader)
-            progress.set_description_str(self.test_description.format(loss=loss))
-            for batch in progress:
-                inputs, targets = self.process_eval_batch(batch)
-                predictions = self.model(inputs)
+                progress_bar.set_description(build_description("Testing", metrics))
 
-                for criterion in reversed(criteria):
-                    loss = criterion(predictions, targets).item()
+        metrics = self.metrics_handler.aggregated_values
+        metrics["Loss"] = loss_cum / len(dataloader)  # Assume that batch are evenly sized
 
-                progress.set_description_str(self.test_description.format(loss=loss))  # Display first criterion only
+        return metrics
 
-        return {criterion.name: criterion.aggregate() for criterion in criteria}
+    def _clean_checkpoints(self):
+        """Delete all the checkpoints except the last one and 'best.ckpt'"""
+        files = os.listdir(os.path.join(self.output_dir, "checkpoints"))
+        for checkpoint_file in filter(lambda file: file[-5:] == ".ckpt", files):
+            if checkpoint_file in {"best.ckpt", f"{self.epoch}.ckpt"}:
+                continue
+            os.remove(os.path.join(self.output_dir, "checkpoints", checkpoint_file))
 
-    def save(self, filename):
-        """Save a checkpoint in the output directory
+    def save(self, filename: str):
+        """Save a checkpoint with the following format
 
-        WIP: For now only save the model
+        {
+            "model": model_state_dict,
+            "optimizer": optimizer_state_dict,
+            "scheduler": scheduler_state_dict, (If any scheduler)
+            "epoch": epoch,
+            "step": step,
+        }
 
         Args:
-            filename (Union[str, PathLike]): Name of the checkpoint file
+            filename (str): Name of the checkpoint file
         """
-        torch.save(self.model.state_dict(), self.output_dir / "checkpoints" / filename)
+        state = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "epoch": self.epoch,
+            "step": self.train_steps,
+        }
+        if self.scheduler:
+            state["scheduler"] = self.scheduler.state_dict()
 
-    def load(self, path):
-        """Not implented yet"""
-        raise NotImplementedError
+        torch.save(state, os.path.join(self.output_dir, "checkpoints", filename))
+
+    def load(self, path: str, strict: bool = True):
+        """Reset the trainer to a given checkpoint
+
+        Args:
+            path (str): Path to a valid checkpoint
+            strict (bool): Allowing partial loading
+        """
+        state = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(state["model"], strict)
+        self.optimizer.load_state_dict(state["optimizer"])
+        if self.scheduler:
+            if "scheduler" in state:
+                self.scheduler.load_state_dict(state["scheduler"])
+            else:
+                if strict:
+                    raise ValueError("Missing scheduler state dict")
+                print("Missing scheduler state dict, keep the current state")
+
+        # Allowing time shifting if epoch/step is not here
+        self.epoch = state.get("epoch", 0)
+        self.train_steps = state.get("step", 0)
+
+        # Ensure all the model is on device
+        self.model.to(self.device)
