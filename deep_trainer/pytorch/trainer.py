@@ -71,6 +71,7 @@ class PytorchTrainer:
         device: torch.device = None,
         output_dir: str = "./experiments",
         save_mode: str = "never",
+        use_amp: bool = False,
     ):
         """Constructor.
 
@@ -100,10 +101,12 @@ class PytorchTrainer:
                 small: Keep only the best checkpoint 'best.ckpt' and the last checkpoint
                        '{epoch}.ckpt' (automatically clean the previous ones)
                 all  : Keep everything. '{epoch}.ckpt' for each epoch and 'best.ckpt'
+            use_amp (bool): Whether to use Automatique Mixed Precision. (with `torch.cuda.amp`)
         """
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
         self.metrics_handler = metrics_handler if metrics_handler else metric.MetricsHandler([])
         self.device = device
         self.output_dir = output_dir
@@ -122,10 +125,15 @@ class PytorchTrainer:
         self.best_val = float("inf")
         self.best_epoch = -1
 
+    @property
+    def use_amp(self) -> bool:
+        """Whether the trainer is using amp or not"""
+        return self.scaler.is_enabled()
+
     def _default_process_batch(self, batch: Any) -> Tuple[Any, Any]:
         inputs, targets = batch
-        inputs = inputs.to(self.device)
-        targets = targets.to(self.device)
+        inputs = inputs.to(self.device, non_blocking=True)
+        targets = targets.to(self.device, non_blocking=True)
         return inputs, targets
 
     def process_train_batch(self, batch: Any) -> Tuple[Any, Any]:
@@ -161,16 +169,34 @@ class PytorchTrainer:
         return self._default_process_batch(batch)
 
     def backward(self, loss: torch.Tensor):
-        """Backpropagation step given the loss
+        """Do the backpropagation step
 
-        Should be overwritten for special backpropagation / optimizer behavior.
+        Called at each training steps with the computed loss, it handles:
+          * The backward of the loss (to be scaled or not if use_amp)
+          * The scheduler, optimizer and scaler step / update
+
+        Should be overwritten for special behavior. Use the default implementation as an example.
+        (For instance you could do gradient accumulation here)
+
+        For more complexe behavior you can avoid calling backward in the trainstep and handle everything yourself.
 
         Args:
             loss (torch.Tensor)
         """
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        self.scaler.scale(loss).backward()
+
+        # XXX: torch.cuda.amp.GradScaler does not provide any way to check whether the step is skipped
+        # We could check some internal stuff like _found_inf_per_device but let's just check whether
+        # scale has halved after the scaler update.
+        previous_scale = self.scaler.get_scale()
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+        if previous_scale <= self.scaler.get_scale():  # Step not skipped
+            if self.scheduler:
+                self.scheduler.step()
 
     def train_step(self, batch: Any, criterion: Callable) -> Dict[str, float]:
         """Perform a training step.
@@ -178,9 +204,9 @@ class PytorchTrainer:
         Should be overwritten for special behaviors. The steps are:
             - Processing the batch from the train dataloader (By default: `PytorchTrainer.process_train_batch`)
             - Compute model outputs (By default: `self.model(inputs)`)
-            - Compute loss and update metrics (if needed) using the criterion and the metrics_handler
-            - Backward as needed (By default: `PytorchTrainer.backward`)
-            - Optional step for the scheduler (Done by default)
+            - Compute loss using the criterion
+            - Backward as needed (By default: `PytorchTrainer.backward` which will handle optimizer and scheduler steps)
+            - Update metrics (if needed) and returns a dictionnary of metrics with a "Loss" entry
 
         Args:
             batch (Any): The batch from the train loader
@@ -193,22 +219,21 @@ class PytorchTrainer:
                 All the items (one by metric by default), will be logged
         """
         inputs, targets = self.process_train_batch(batch)
-        predictions = self.model(inputs)
 
-        self.metrics_handler.update(predictions, targets)
-        loss: torch.Tensor = criterion(predictions, targets)
+        with torch.cuda.amp.autocast(self.use_amp):
+            predictions = self.model(inputs)
+            loss: torch.Tensor = criterion(predictions, targets)
 
         self.backward(loss)
-        if self.scheduler:
-            self.scheduler.step()
 
+        self.metrics_handler.update(predictions.detach(), targets)
         metrics = self.metrics_handler.last_values
         metrics["Loss"] = loss.item()
 
         return metrics
 
     def eval_step(self, batch: Any, criterion: Callable) -> Dict[str, float]:
-        """Perform a evaluation step.
+        """Perform an evaluation step.
 
         Args:
             batch (Any): Batch from the dataloader given to evaluate
@@ -220,11 +245,12 @@ class PytorchTrainer:
                 Should contain a "Loss" entry
         """
         inputs, targets = self.process_eval_batch(batch)
-        predictions = self.model(inputs)
+
+        with torch.cuda.amp.autocast(self.use_amp):
+            predictions = self.model(inputs)
+            loss: torch.Tensor = criterion(predictions, targets)
 
         self.metrics_handler.update(predictions, targets)
-        loss: torch.Tensor = criterion(predictions, targets)
-
         metrics = self.metrics_handler.last_values
         metrics["Loss"] = loss.item()
 
@@ -287,10 +313,12 @@ class PytorchTrainer:
                 loss_cum += metrics["Loss"]
 
                 for metric_name in metrics:
-                    self.logger.log(f"train/{metric_name}", metrics[metric_name], self.train_steps)
+                    self.logger.log(f"A_train/{metric_name}", metrics[metric_name], self.train_steps)
 
                 for i, group in enumerate(self.optimizer.param_groups):
-                    self.logger.log(f"lr/group_{i}", group["lr"], self.train_steps)
+                    self.logger.log(f"Z_other/lr_{i}", group["lr"], self.train_steps)
+
+                self.logger.log("Z_other/scale", self.scaler.get_scale(), self.train_steps)
 
                 progress_bar.set_description(build_description("Training", metrics))
                 self.train_steps += 1
@@ -307,7 +335,7 @@ class PytorchTrainer:
             if val_loader is not None:
                 metrics = self.evaluate(val_loader, val_criterion)
                 for metric_name in metrics:
-                    self.logger.log(f"val/{metric_name}", metrics[metric_name], self.train_steps)
+                    self.logger.log(f"B_val/{metric_name}", metrics[metric_name], self.train_steps)
 
                 if metrics["Loss"] < self.best_val:
                     self.best_val = metrics["Loss"]
@@ -369,6 +397,7 @@ class PytorchTrainer:
             "model": model_state_dict,
             "optimizer": optimizer_state_dict,
             "scheduler": scheduler_state_dict, (If any scheduler)
+            "scaler": scaler_state_dict, (If use_amp)
             "epoch": epoch,
             "step": step,
         }
@@ -384,6 +413,8 @@ class PytorchTrainer:
         }
         if self.scheduler:
             state["scheduler"] = self.scheduler.state_dict()
+        if self.use_amp:
+            state["scaler"] = self.scaler.state_dict()
 
         torch.save(state, os.path.join(self.output_dir, "checkpoints", filename))
 
@@ -403,7 +434,15 @@ class PytorchTrainer:
             else:
                 if strict:
                     raise ValueError("Missing scheduler state dict")
-                print("Missing scheduler state dict, keep the current state")
+                print("Missing scheduler state dict. Keeping the current state")
+
+        if self.use_amp:
+            if state.get("scaler"):
+                self.scaler.load_state_dict(state["scaler"])
+            else:
+                if strict:
+                    raise ValueError("Missing scheduler state dict")
+                print("Missing scaler state dict. Keeping the current state")
 
         # Allowing time shifting if epoch/step is not here
         self.epoch = state.get("epoch", 0)
