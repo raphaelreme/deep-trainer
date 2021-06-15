@@ -441,7 +441,7 @@ class PytorchTrainer:
                 self.scaler.load_state_dict(state["scaler"])
             else:
                 if strict:
-                    raise ValueError("Missing scheduler state dict")
+                    raise ValueError("Missing scaler state dict")
                 print("Missing scaler state dict. Keeping the current state")
 
         # Allowing time shifting if epoch/step is not here
