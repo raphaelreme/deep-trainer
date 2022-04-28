@@ -19,13 +19,13 @@ from . import metric
 def round_to_n(x: float, n_digits: int) -> float:
     """Round a floating point to n significant digits
 
-        Args:
-            x (float): Number to round
-            n_digits (int): Number of digits to keep
+    Args:
+        x (float): Number to round
+        n_digits (int): Number of digits to keep
 
-        Returns:
-            float: Rounded version of x with n_digits digits
-        """
+    Returns:
+        float: Rounded version of x with n_digits digits
+    """
     if not math.isfinite(x) or x == 0:
         return x
     main_digit = math.floor(math.log10(abs(x)))
@@ -326,7 +326,7 @@ class PytorchTrainer:
             metrics = self.metrics_handler.aggregated_values
             self.epoch += 1
 
-            if self.save_mode != "never":
+            if self.save_mode in ("small", "all"):
                 self.save(f"{self.epoch}.ckpt")
 
                 if self.save_mode == "small":
