@@ -2,7 +2,7 @@
 
 import math
 import os
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Tuple
 
 import torch
 import torch.utils.data
@@ -54,13 +54,28 @@ def build_description(name: str, metrics: Dict[str, float]) -> str:
     return desc
 
 
+def cyclic_iterator(iterable: Iterable):
+    """Build a infinite cyclic iterator over an iterable
+
+    Different from `itertools.cycle`: It does not try to keep the first iteration in memory
+    (heavy and we want to keep randomness in dataloaders)
+
+    Args:
+        iterable (Iterable)
+    """
+    iterator = iter(iterable)
+    while True:
+        try:
+            yield next(iterator)
+        except StopIteration:
+            iterator = iter(iterable)
+
+
 class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
     """Base trainer for pytorch project.
 
     Wraps all the training procedures for a given model, optimizer and scheduler.
     """
-
-    epoch_description = "{desc} [{step}/{total_step}]\n"
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -90,8 +105,9 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
                 Default: None
             metrics_handler (metric.MetricdHandler): Handle a list of metrics to track.
                 See the documentation of `Metric` for more info.
-                In addition of those metrics, the `train` and `evaluate` method expect a criterion to compute
-                a loss. (the training one should be differentiable unless you do your own backpropagation)
+                In order to train, an additional criterion should be given to compute a differentiable loss.
+                In order to select the best model on a validation metric, you should select the validation metric
+                of the metrics_handler. Otherwise the train criterion will be used.
             device (torch.device): Torch device to use. If None, the default device will be cuda:0
                 (or cpu if cuda is not available)
                 TPU or Multi device training is not supported yet.
@@ -122,7 +138,8 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         self.train_steps = 0
         self.epoch = 0
-        self.best_val = float("inf")
+        self.val = float("nan")
+        self.best_val = float("nan")
         self.best_epoch = -1
 
     @property
@@ -223,22 +240,20 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         with torch.cuda.amp.autocast(self.use_amp):
             predictions = self.model(inputs)
             loss: torch.Tensor = criterion(predictions, targets)
+            self.metrics_handler.update((inputs, targets), predictions.detach())
 
         self.backward(loss)
 
-        self.metrics_handler.update(predictions.detach(), targets)
         metrics = self.metrics_handler.last_values
         metrics["Loss"] = loss.item()
 
         return metrics
 
-    def eval_step(self, batch: Any, criterion: Callable) -> Dict[str, float]:
-        """Perform an evaluation step.
+    def eval_step(self, batch: Any) -> Dict[str, float]:
+        """Perform an evaluation step with the metrics
 
         Args:
             batch (Any): Batch from the dataloader given to evaluate
-            criterion (Callable): Loss function given to the evaluate method.
-                See `PytorchTrainer.evaluate` documentation.
 
         Returns:
             Dict[str, float]: Evaluation of the metrics on this batch
@@ -248,24 +263,75 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         with torch.cuda.amp.autocast(self.use_amp):
             predictions = self.model(inputs)
-            loss: torch.Tensor = criterion(predictions, targets)
+            self.metrics_handler.update((inputs, targets), predictions)
 
-        self.metrics_handler.update(predictions, targets)
+        return self.metrics_handler.last_values
+
+    def _single_epoch_train(self, train_iterator: Iterator, criterion: Callable, epoch_size: int) -> float:
+        """Performs a single epoch training of the `train` method"""
+        self.model.train()
+        self.metrics_handler.train()
+        self.metrics_handler.reset()
+        loss_cum = 0.0
         metrics = self.metrics_handler.last_values
-        metrics["Loss"] = loss.item()
+        metrics["Loss"] = float("nan")
 
-        return metrics
+        progress_bar = tqdm.trange(epoch_size)
+        progress_bar.set_description(build_description("Training", metrics))
+        for _ in progress_bar:
+            batch = next(train_iterator)
 
-    def train(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
+            metrics = self.train_step(batch, criterion)
+            loss_cum += metrics["Loss"]
+
+            for metric_name, metric_value in metrics.items():
+                self.logger.log(f"A_train_batch/{metric_name}", metric_value, self.train_steps)
+
+            for i, group in enumerate(self.optimizer.param_groups):
+                self.logger.log(f"Z_other/lr_{i}", group["lr"], self.train_steps)
+
+            self.logger.log("Z_other/scale", self.scaler.get_scale(), self.train_steps)
+
+            progress_bar.set_description(build_description("Training", metrics))
+            self.train_steps += 1
+
+        return loss_cum / epoch_size  # Assume that batch are evenly sized
+
+    def _handle_validation_metrics(self, metrics: Dict[str, float]) -> None:
+        """Handle validation metrics
+
+        If metrics are better, update best_val, best_epoch and save
+        """
+        val_metric = self.metrics_handler.get_validation_metric()
+        if not val_metric:
+            return  # FIXME: Warning rather than nothing
+
+        self.val = metrics[val_metric.display_name]
+
+        if not math.isnan(self.best_val):
+            if val_metric.minimize and self.val >= self.best_val:
+                return
+
+            if not val_metric.minimize and self.val <= self.best_val:
+                return
+
+        self.best_val = self.val
+        self.best_epoch = self.epoch
+        if self.save_mode in ("small", "all"):
+            self.save("best.ckpt")
+
+    def train(
         self,
         epochs: int,
         train_loader: torch.utils.data.DataLoader,
         criterion: Callable,
         val_loader: torch.utils.data.DataLoader = None,
-        val_criterion: Callable = None,
         epoch_size: int = 0,
     ) -> "PytorchTrainer":
         """Train the model
+
+        Note:
+            If no validation metric is set in the metrics handler, then the criterion will be used
 
         Args:
             epochs (int): Number of epochs to perform (Should be greater than 0)
@@ -275,8 +341,6 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
                 It should be differentiable.
             val_loader (torch.utils.data.Dataloader): Optional validation data loader. If provided the
                 model will be evaluate after each epoch with it. If not, no validation is done.
-            val_criterion (Callable): Optional validation criterion. Used to compute a validation loss on the
-                val_loader. It not given, criterion will be used instead.
             epoch_size (int): The number of training steps for each epochs.
                 By default the length of the train_loader is used.
 
@@ -288,43 +352,35 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         if epoch_size == 0:
             epoch_size = len(train_loader)
 
-        if val_criterion is None:
-            val_criterion = criterion
+        # If no validation metric, let's create one from the train criterion
+        no_validation_metric = self.metrics_handler.get_validation_metric() is None
+        if no_validation_metric:
+            self.metrics_handler.metrics.insert(0, metric.PytorchMetric(criterion, "Loss", False, True, True))
+            self.metrics_handler.set_validation_metric(0)
 
-        train_iterator = iter(train_loader)
+        train_iterator = cyclic_iterator(train_loader)
         while self.epoch < n_epochs:
-            self.model.train()
-            self.metrics_handler.train()
-            self.metrics_handler.reset()
-            loss_cum = 0.0
-            metrics = self.metrics_handler.last_values
-            metrics["Loss"] = float("nan")
-
-            progress_bar = tqdm.trange(epoch_size)
-            progress_bar.set_description(build_description("Training", metrics))
-            for _ in progress_bar:
-                try:
-                    batch = next(train_iterator)
-                except StopIteration:
-                    train_iterator = iter(train_loader)
-                    batch = next(train_iterator)
-
-                metrics = self.train_step(batch, criterion)
-                loss_cum += metrics["Loss"]
-
-                for metric_name, metric_value in metrics.items():
-                    self.logger.log(f"A_train/{metric_name}", metric_value, self.train_steps)
-
-                for i, group in enumerate(self.optimizer.param_groups):
-                    self.logger.log(f"Z_other/lr_{i}", group["lr"], self.train_steps)
-
-                self.logger.log("Z_other/scale", self.scaler.get_scale(), self.train_steps)
-
-                progress_bar.set_description(build_description("Training", metrics))
-                self.train_steps += 1
+            loss = self._single_epoch_train(train_iterator, criterion, epoch_size)
+            self.epoch += 1
 
             metrics = self.metrics_handler.aggregated_values
-            self.epoch += 1
+            metrics["Loss"] = loss
+            print(build_description(f"Epoch {self.epoch}/{n_epochs} - Train metrics", metrics), flush=True)
+
+            for metric_name, metric_value in metrics.items():
+                self.logger.log(f"A_train_aggregate/{metric_name}", metric_value, self.train_steps)
+
+            if val_loader is not None:
+                val_metrics = self.evaluate(val_loader)
+
+                for metric_name, metric_value in val_metrics.items():
+                    self.logger.log(f"B_val/{metric_name}", metric_value, self.train_steps)
+
+                self._handle_validation_metrics(val_metrics)
+
+                print(build_description(f"Epoch {self.epoch}/{n_epochs} - Eval metrics", metrics), flush=True)
+
+            print(flush=True)
 
             if self.save_mode in ("small", "all"):
                 self.save(f"{self.epoch}.ckpt")
@@ -332,31 +388,17 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
                 if self.save_mode == "small":
                     self._clean_checkpoints()
 
-            if val_loader is not None:
-                metrics = self.evaluate(val_loader, val_criterion)
-                for metric_name, metric_value in metrics.items():
-                    self.logger.log(f"B_val/{metric_name}", metric_value, self.train_steps)
-
-                if metrics["Loss"] < self.best_val:
-                    self.best_val = metrics["Loss"]
-                    self.best_epoch = self.epoch
-                    if self.save_mode != "never":
-                        self.save("best.ckpt")
-
-                metrics["Avg Val Loss"] = metrics.pop("Loss")  # Rename Loss
-
-            # Use val metrics if possible (and only the avg train loss from train loop)
-            metrics["Avg Train Loss"] = loss_cum / epoch_size  # Assume that batch are evenly sized
-            print(build_description(f"Epoch {self.epoch}/{n_epochs}", metrics), end="\n\n", flush=True)
+        if no_validation_metric:
+            self.metrics_handler.metrics.pop(0)
+            self.metrics_handler._validation_metric = None  # pylint: disable=protected-access
 
         return self
 
-    def evaluate(self, dataloader: torch.utils.data.DataLoader, criterion: Callable) -> Dict[str, float]:
+    def evaluate(self, dataloader: torch.utils.data.DataLoader) -> Dict[str, float]:
         """Evaluate the current model with the metrics on the dataloader
 
         Args:
             dataloader (torch.utils.data.Dataloader): Dataloader over the dataset to evaluate
-            criterion (Callable): Main criterion of the evaluation. Should be minimized.
 
         Returns:
             Dict[str, float]: Aggregated metrics
@@ -364,23 +406,17 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.model.eval()
         self.metrics_handler.eval()
         self.metrics_handler.reset()
-        loss_cum = 0.0
         metrics = self.metrics_handler.last_values
-        metrics["Loss"] = float("nan")
 
         with torch.no_grad():
             progress_bar = tqdm.tqdm(dataloader)
             progress_bar.set_description(build_description("Testing", metrics))
             for batch in progress_bar:
-                metrics = self.eval_step(batch, criterion)
-                loss_cum += metrics["Loss"]
+                metrics = self.eval_step(batch)
 
                 progress_bar.set_description(build_description("Testing", metrics))
 
-        metrics = self.metrics_handler.aggregated_values
-        metrics["Loss"] = loss_cum / len(dataloader)  # Assume that batch are evenly sized
-
-        return metrics
+        return self.metrics_handler.aggregated_values
 
     def _clean_checkpoints(self):
         """Delete all the checkpoints except the last one and 'best.ckpt'"""
@@ -400,6 +436,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             "scaler": scaler_state_dict, (If use_amp)
             "epoch": epoch,
             "step": step,
+            "val_metric": validation_metric, (self.val)
         }
 
         Args:
@@ -410,6 +447,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             "optimizer": self.optimizer.state_dict(),
             "epoch": self.epoch,
             "step": self.train_steps,
+            "val_metric": self.val,
         }
         if self.scheduler:
             state["scheduler"] = self.scheduler.state_dict()
@@ -447,6 +485,11 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         # Allowing time shifting if epoch/step is not here
         self.epoch = state.get("epoch", 0)
         self.train_steps = state.get("step", 0)
+        self.val = state.get("val_metric", float("nan"))
+
+        # When reloading a training ckpt, best val and epoch are the starting point
+        self.best_epoch = self.epoch
+        self.best_val = self.val
 
         # Ensure all the model is on device
         self.model.to(self.device)

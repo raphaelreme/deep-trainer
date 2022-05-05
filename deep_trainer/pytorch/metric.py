@@ -3,16 +3,13 @@
 Provide some examples of useful metrics for classification
 """
 
-from typing import Any, Callable, Dict, Iterator, List
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
 
 class Metric:
     """Base class for metric to be tracked during training.
-
-    Could probably be more general but for now let's assume that any metric can be computed
-    from the predictions of the models and some targets.
 
     A metric is updated at each batch, and can be aggregated whenever it is necessary.
     A last value can be accessed. But for some metrics it will not make sense and NaN can be returned
@@ -22,21 +19,23 @@ class Metric:
         display_name (str): Name to be used in the loggers
         train (bool): Compute this metric during train loop
         evaluate (bool): Compute this metric during evaluate loop
+        minimize (bool): Should the metric be minimized or maximized
     """
 
-    def __init__(self, display_name: str = None, train: bool = True, evaluate: bool = True):
+    def __init__(self, display_name: str = None, train: bool = True, evaluate: bool = True, minimize=True):
         self.last_value = float("nan")
         self.display_name = display_name if display_name else self.__class__.__name__
         self.train = train
         self.evaluate = evaluate
+        self.minimize = minimize
 
-    def update(self, predictions: Any, targets: Any):
+    def update(self, batch: Any, outputs: Any):
         """Update the metric with the current batch, and set the metric last_value for this
         particular batch if this makes sense.
 
         Args:
-            predictions (Any): Output of the model
-            targets (Any): Target values
+            batch (Any): Batch used for outputs computation. Probably contains labels
+            outputs (Any): Output of the model
         """
         raise NotImplementedError
 
@@ -59,6 +58,7 @@ class MetricsHandler:
     def __init__(self, metrics: List[Metric]):
         self.training = True
         self.metrics = metrics
+        self._validation_metric: Optional[Metric] = None
 
     def current_metrics(self) -> Iterator[Metric]:
         """Return an iterator on the current metrics
@@ -68,11 +68,7 @@ class MetricsHandler:
         """
 
         def func(metric: Metric) -> bool:
-            if self.training and not metric.train:
-                return False
-            if (not self.training) and (not metric.evaluate):
-                return False
-            return True
+            return self.training and metric.train or not self.training and metric.evaluate
 
         return filter(func, self.metrics)
 
@@ -88,7 +84,29 @@ class MetricsHandler:
         """Switch to evaluate metrics"""
         self.train(False)
 
-    def update(self, predictions: Any, targets: Any):
+    def get_validation_metric(self) -> Optional[Metric]:
+        """Get the validation metric
+
+        Returns None if not set.
+
+        Returns:
+            Optional[Metric]
+        """
+        return self._validation_metric
+
+    def set_validation_metric(self, index: int):
+        """Select a validation metric
+
+        Without validation metric, the train criterion is used by default to validate training.
+
+        Args:
+            index (int): Index of the metric
+        """
+        if not self.metrics[index].evaluate:
+            raise ValueError(f"Metric {self.metrics[index]} at {index} is not in evaluate mode")
+        self._validation_metric = self.metrics[index]
+
+    def update(self, batch: Any, outputs: Any):
         """Update all the metrics for the current mode
 
         For a more finegrained control, each metric can be updated on its own.
@@ -100,11 +118,11 @@ class MetricsHandler:
         ```
 
         Args:
-            predictions (Any): Output of the model
-            targets (Any): Target values
+            batch (Any): Batch used for outputs computation. Probably contains labels
+            outputs (Any): Output of the model
         """
         for metric in self.current_metrics():
-            metric.update(predictions, targets)
+            metric.update(batch, outputs)
 
     @property
     def last_values(self) -> Dict[str, float]:
@@ -138,17 +156,26 @@ class MetricsHandler:
 class PytorchMetric(Metric):
     """Average a pytorch loss function"""
 
-    def __init__(self, loss_function: Callable, display_name: str = None, train: bool = True, evaluate: bool = True):
+    def __init__(
+        self,
+        loss_function: Callable,
+        display_name: str = None,
+        train: bool = True,
+        evaluate: bool = True,
+        minimize: bool = True,
+    ):
         if display_name is None:
             display_name = getattr(loss_function, "__name__", getattr(loss_function, "__class__").__name__)
 
-        super().__init__(display_name=display_name, train=train, evaluate=evaluate)
+        super().__init__(display_name=display_name, train=train, evaluate=evaluate, minimize=minimize)
         self.loss_function = loss_function
         self._sum = 0
         self._n_samples = 0
 
-    def update(self, predictions: Any, targets: Any):
-        loss = self.loss_function(predictions, targets)
+    def update(self, batch, outputs):
+        _, targets = batch
+
+        loss = self.loss_function(outputs, targets)
         batch_size = targets.shape[0]
         self._sum += loss.item() * batch_size
         self._n_samples += batch_size
@@ -170,7 +197,7 @@ class Accuracy(PytorchMetric):
     """
 
     def __init__(self, train: bool = True, evaluate: bool = True):
-        super().__init__(self._compute, "Accuracy", train, evaluate)
+        super().__init__(self._compute, "Accuracy", train, evaluate, False)
 
     @staticmethod
     def _compute(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -185,7 +212,7 @@ class Error(PytorchMetric):
     """
 
     def __init__(self, train: bool = True, evaluate: bool = True):
-        super().__init__(self._compute, "Error", train, evaluate)
+        super().__init__(self._compute, "Error", train, evaluate, False)
 
     @staticmethod
     def _compute(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -200,7 +227,7 @@ class TopK(PytorchMetric):
     """
 
     def __init__(self, k: int, train: bool = True, evaluate: bool = True):
-        super().__init__(self._compute, f"Top-{k}", train, evaluate)
+        super().__init__(self._compute, f"Top-{k}", train, evaluate, False)
         self.k = k
 
     def _compute(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -218,12 +245,14 @@ class BalancedAccuracy(Metric):
     """
 
     def __init__(self, train: bool = True, evaluate: bool = True):
-        super().__init__("BalancedAccuracy", train, evaluate)
+        super().__init__("BalancedAccuracy", train, evaluate, False)
         self.target_occurences: Dict[int, int] = {}
         self.true_positives: Dict[int, int] = {}
 
-    def update(self, predictions: torch.Tensor, targets: torch.Tensor):
-        predicted_targets = torch.argmax(predictions, dim=1)
+    def update(self, batch: Tuple[torch.Tensor, torch.Tensor], outputs: torch.Tensor):
+        _, targets = batch
+
+        predicted_targets = torch.argmax(outputs, dim=1)
 
         assert predicted_targets.shape == targets.shape
         assert len(predicted_targets.shape) == 1
