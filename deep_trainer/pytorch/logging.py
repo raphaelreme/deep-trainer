@@ -10,6 +10,9 @@ from typing import Dict, List, Tuple
 import torch.utils.tensorboard
 
 
+# pylint: disable=too-few-public-methods
+
+
 class TrainLogger:
     """Base logger class. By default, do not log.
 

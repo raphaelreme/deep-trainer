@@ -236,7 +236,7 @@ class BalancedAccuracy(Metric):
             self.true_positives[target] = self.true_positives.get(target, 0) + (target == predicted)
 
     def aggregate(self) -> float:
-        recall = [self.true_positives[target] / self.target_occurences[target] for target in self.target_occurences]
+        recall = [self.true_positives[target] / occurence for target, occurence in self.target_occurences.items()]
         return sum(recall) / len(recall)
 
     def reset(self):

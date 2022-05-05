@@ -54,7 +54,7 @@ def build_description(name: str, metrics: Dict[str, float]) -> str:
     return desc
 
 
-class PytorchTrainer:
+class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
     """Base trainer for pytorch project.
 
     Wraps all the training procedures for a given model, optimizer and scheduler.
@@ -62,7 +62,7 @@ class PytorchTrainer:
 
     epoch_description = "{desc} [{step}/{total_step}]\n"
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
@@ -256,7 +256,7 @@ class PytorchTrainer:
 
         return metrics
 
-    def train(
+    def train(  # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
         self,
         epochs: int,
         train_loader: torch.utils.data.DataLoader,
@@ -312,8 +312,8 @@ class PytorchTrainer:
                 metrics = self.train_step(batch, criterion)
                 loss_cum += metrics["Loss"]
 
-                for metric_name in metrics:
-                    self.logger.log(f"A_train/{metric_name}", metrics[metric_name], self.train_steps)
+                for metric_name, metric_value in metrics.items():
+                    self.logger.log(f"A_train/{metric_name}", metric_value, self.train_steps)
 
                 for i, group in enumerate(self.optimizer.param_groups):
                     self.logger.log(f"Z_other/lr_{i}", group["lr"], self.train_steps)
@@ -334,8 +334,8 @@ class PytorchTrainer:
 
             if val_loader is not None:
                 metrics = self.evaluate(val_loader, val_criterion)
-                for metric_name in metrics:
-                    self.logger.log(f"B_val/{metric_name}", metrics[metric_name], self.train_steps)
+                for metric_name, metric_value in metrics.items():
+                    self.logger.log(f"B_val/{metric_name}", metric_value, self.train_steps)
 
                 if metrics["Loss"] < self.best_val:
                     self.best_val = metrics["Loss"]
