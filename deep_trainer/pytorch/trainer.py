@@ -2,6 +2,7 @@
 
 import math
 import os
+import sys
 from typing import Any, Callable, Dict, Iterable, Iterator, Tuple
 
 import torch
@@ -281,7 +282,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         metrics = self.metrics_handler.last_values
         metrics["Loss"] = float("nan")
 
-        progress_bar = tqdm.trange(epoch_size)
+        progress_bar = tqdm.trange(epoch_size, file=sys.stdout)
         progress_bar.set_description(build_description(self.train_bar_name, metrics))
         for _ in progress_bar:
             batch = next(train_iterator)
@@ -417,7 +418,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         metrics = self.metrics_handler.last_values
 
         with torch.no_grad():
-            progress_bar = tqdm.tqdm(dataloader)
+            progress_bar = tqdm.tqdm(dataloader, file=sys.stdout)
             progress_bar.set_description(build_description(self.eval_bar_name, metrics))
             for batch in progress_bar:
                 metrics = self.eval_step(batch)
