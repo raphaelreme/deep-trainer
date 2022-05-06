@@ -47,7 +47,7 @@ def build_description(name: str, metrics: Dict[str, float]) -> str:
     if metrics:
         desc += " --- "
 
-        for metric_name in metrics:
+        for metric_name in sorted(metrics):
             desc += f"{metric_name}: {round_to_n(metrics[metric_name], 4):7}, "
         desc = desc[:-2]
 
@@ -76,6 +76,11 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
     Wraps all the training procedures for a given model, optimizer and scheduler.
     """
+
+    train_bar_name = "Training"
+    eval_bar_name = "Testing "
+    train_avg_name = "Avg Train Metrics"
+    eval_avg_name = "Avg Eval Metrics "
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -277,7 +282,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         metrics["Loss"] = float("nan")
 
         progress_bar = tqdm.trange(epoch_size)
-        progress_bar.set_description(build_description("Training", metrics))
+        progress_bar.set_description(build_description(self.train_bar_name, metrics))
         for _ in progress_bar:
             batch = next(train_iterator)
 
@@ -292,7 +297,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
             self.logger.log("Z_other/scale", self.scaler.get_scale(), self.train_steps)
 
-            progress_bar.set_description(build_description("Training", metrics))
+            progress_bar.set_description(build_description(self.train_bar_name, metrics))
             self.train_steps += 1
 
         return loss_cum / epoch_size  # Assume that batch are evenly sized
@@ -360,12 +365,12 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         train_iterator = cyclic_iterator(train_loader)
         while self.epoch < n_epochs:
+            print(f"Epoch {self.epoch + 1}/{n_epochs}")
             loss = self._single_epoch_train(train_iterator, criterion, epoch_size)
             self.epoch += 1
 
             metrics = self.metrics_handler.aggregated_values
             metrics["Loss"] = loss
-            print(build_description(f"Epoch {self.epoch}/{n_epochs} - Train metrics", metrics), flush=True)
 
             for metric_name, metric_value in metrics.items():
                 self.logger.log(f"A_train_aggregate/{metric_name}", metric_value, self.train_steps)
@@ -378,9 +383,12 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
                 self._handle_validation_metrics(val_metrics)
 
-                print(build_description(f"Epoch {self.epoch}/{n_epochs} - Eval metrics", metrics), flush=True)
+                print(build_description(self.train_avg_name.format(self.epoch, n_epochs), metrics), flush=True)
+                print(build_description(self.eval_avg_name.format(self.epoch, n_epochs), val_metrics), flush=True)
+            else:
+                print(build_description(self.train_avg_name.format(self.epoch, n_epochs), metrics), flush=True)
 
-            print(flush=True)
+            print(flush=True)  # Let's jump a line
 
             if self.save_mode in ("small", "all"):
                 self.save(f"{self.epoch}.ckpt")
@@ -410,11 +418,11 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         with torch.no_grad():
             progress_bar = tqdm.tqdm(dataloader)
-            progress_bar.set_description(build_description("Testing", metrics))
+            progress_bar.set_description(build_description(self.eval_bar_name, metrics))
             for batch in progress_bar:
                 metrics = self.eval_step(batch)
 
-                progress_bar.set_description(build_description("Testing", metrics))
+                progress_bar.set_description(build_description(self.eval_bar_name, metrics))
 
         return self.metrics_handler.aggregated_values
 
