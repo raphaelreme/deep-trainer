@@ -464,23 +464,30 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         torch.save(state, os.path.join(self.output_dir, "checkpoints", filename))
 
-    def load(self, path: str, strict: bool = True):
+    def load(self, path: str, strict: bool = False, restore_optim_hp: bool = True):
         """Reset the trainer to a given checkpoint
+
+        It will reload model weights, optimizer state and hyper parameters (with scheduler),
+        scaler state. Note that the best validation metric is not stored in the checkpoint,
+        therefore it use the current validation metric as the best one.
 
         Args:
             path (str): Path to a valid checkpoint
             strict (bool): Allowing partial loading
+                If True, will raise exception when missing keys are found
+            restore_optim_hp (bool): Whether to restore optimizer and scheduler hyper parameters.
+                Usual hyper parameters are learning rate (with its schedule), weight decay, momentum, etc
+                By default restores everything to restart the training as originally planned.
+                If False, it only restores the state of the optimizer and keep the current set of
+                hyper parameters (For the scheduler, there is nothing to load and you can even use
+                another scheduler).
+
+                Warning: With weight decay, it's common to build two param groups (one with wd and one without).
+                    When reloading with no weight decay, you should still split the params in these two groups, even
+                    if each group has the same hyper parameters.
         """
         state = torch.load(path, map_location=self.device)
         self.model.load_state_dict(state["model"], strict)
-        self.optimizer.load_state_dict(state["optimizer"])
-        if self.scheduler:
-            if "scheduler" in state:
-                self.scheduler.load_state_dict(state["scheduler"])
-            else:
-                if strict:
-                    raise ValueError("Missing scheduler state dict")
-                print("Missing scheduler state dict. Keeping the current state")
 
         if self.use_amp:
             if state.get("scaler"):
@@ -489,6 +496,20 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
                 if strict:
                     raise ValueError("Missing scaler state dict")
                 print("Missing scaler state dict. Keeping the current state")
+
+        if restore_optim_hp:
+            self.optimizer.load_state_dict(state["optimizer"])
+        else:
+            hyper_parameters = self.optimizer.state_dict()["param_groups"]
+            self.optimizer.load_state_dict({"state": state["optimizer"]["state"], "param_groups": hyper_parameters})
+
+        if self.scheduler and restore_optim_hp:
+            if "scheduler" in state:
+                self.scheduler.load_state_dict(state["scheduler"])
+            else:
+                if strict:
+                    raise ValueError("Missing scheduler state dict")
+                print("Missing scheduler state dict. Keeping the current state")
 
         # Allowing time shifting if epoch/step is not here
         self.epoch = state.get("epoch", 0)
