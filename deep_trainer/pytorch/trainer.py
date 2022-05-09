@@ -273,14 +273,14 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         return self.metrics_handler.last_values
 
-    def _single_epoch_train(self, train_iterator: Iterator, criterion: Callable, epoch_size: int) -> float:
+    def _single_epoch_train(self, train_iterator: Iterator, criterion: Callable, epoch_size: int) -> Dict[str, float]:
         """Performs a single epoch training of the `train` method"""
         self.model.train()
         self.metrics_handler.train()
         self.metrics_handler.reset()
-        loss_cum = 0.0
         metrics = self.metrics_handler.last_values
         metrics["Loss"] = float("nan")
+        cum_metrics: Dict[str, float] = {}
 
         progress_bar = tqdm.trange(epoch_size, file=sys.stdout)
         progress_bar.set_description(build_description(self.train_bar_name, metrics))
@@ -288,9 +288,9 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             batch = next(train_iterator)
 
             metrics = self.train_step(batch, criterion)
-            loss_cum += metrics["Loss"]
 
             for metric_name, metric_value in metrics.items():
+                cum_metrics[metric_name] = cum_metrics.get(metric_name, 0) + metric_value
                 self.logger.log(f"A_train_batch/{metric_name}", metric_value, self.train_steps)
 
             for i, group in enumerate(self.optimizer.param_groups):
@@ -301,7 +301,15 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             progress_bar.set_description(build_description(self.train_bar_name, metrics))
             self.train_steps += 1
 
-        return loss_cum / epoch_size  # Assume that batch are evenly sized
+        metrics = self.metrics_handler.aggregated_values
+
+        # Add extra metric added by hand by the user
+        for metric_name, metric_value in cum_metrics.items():
+            if metric_name in metrics:
+                continue  # Keep aggregated version
+            metrics[metric_name] = metric_value / epoch_size
+
+        return metrics
 
     def _handle_validation_metrics(self, metrics: Dict[str, float]) -> None:
         """Handle validation metrics
@@ -367,11 +375,8 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         train_iterator = cyclic_iterator(train_loader)
         while self.epoch < n_epochs:
             print(f"Epoch {self.epoch + 1}/{n_epochs}")
-            loss = self._single_epoch_train(train_iterator, criterion, epoch_size)
+            metrics = self._single_epoch_train(train_iterator, criterion, epoch_size)
             self.epoch += 1
-
-            metrics = self.metrics_handler.aggregated_values
-            metrics["Loss"] = loss
 
             for metric_name, metric_value in metrics.items():
                 self.logger.log(f"A_train_aggregate/{metric_name}", metric_value, self.train_steps)
@@ -416,6 +421,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.metrics_handler.eval()
         self.metrics_handler.reset()
         metrics = self.metrics_handler.last_values
+        cum_metrics: Dict[str, float] = {}
 
         with torch.no_grad():
             progress_bar = tqdm.tqdm(dataloader, file=sys.stdout)
@@ -423,9 +429,20 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             for batch in progress_bar:
                 metrics = self.eval_step(batch)
 
+                for metric_name, metric_value in metrics.items():
+                    cum_metrics[metric_name] = cum_metrics.get(metric_name, 0) + metric_value
+
                 progress_bar.set_description(build_description(self.eval_bar_name, metrics))
 
-        return self.metrics_handler.aggregated_values
+        metrics = self.metrics_handler.aggregated_values
+
+        # Add extra metric added by hand by the user
+        for metric_name, metric_value in cum_metrics.items():
+            if metric_name in metrics:
+                continue  # Keep aggregated version
+            metrics[metric_name] = metric_value / len(dataloader)
+
+        return metrics
 
     def _clean_checkpoints(self):
         """Delete all the checkpoints except the last one and 'best.ckpt'"""
