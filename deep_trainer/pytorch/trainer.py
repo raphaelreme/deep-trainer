@@ -90,6 +90,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         scheduler: torch.optim.lr_scheduler._LRScheduler = None,
         metrics_handler: metric.MetricsHandler = None,
         device: torch.device = None,
+        logger: logging.TrainLogger = None,
         output_dir: str = "./experiments",
         save_mode: str = "never",
         use_amp: bool = False,
@@ -117,6 +118,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             device (torch.device): Torch device to use. If None, the default device will be cuda:0
                 (or cpu if cuda is not available)
                 TPU or Multi device training is not supported yet.
+            logger (TrainLogger): Logger object. If not provided a default tensorboard logger will be created.
             output_dir (str): output directory, where checkpoints, logs, [...] are saved
             save_mode ("never"|"small"|"all"): Checkpointing mode (see `save` and `load`)
                 never: No checkpoint for this training
@@ -140,7 +142,12 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         os.makedirs(os.path.join(self.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "logs"), exist_ok=True)
-        self.logger = logging.TensorBoardLogger(os.path.join(self.output_dir, "logs"))
+
+        self.logger: logging.TrainLogger
+        if logger is not None:
+            self.logger = logger
+        else:
+            self.logger = logging.TensorBoardLogger(os.path.join(self.output_dir, "logs"))
 
         self.train_steps = 0
         self.epoch = 0
@@ -464,6 +471,8 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             "step": step,
             "val_metric": validation_metric, (self.val)
         }
+
+        Saved at {output_dir}/checkpoints/filename
 
         Args:
             filename (str): Name of the checkpoint file
