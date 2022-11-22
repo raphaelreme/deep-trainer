@@ -4,6 +4,7 @@ import math
 import os
 import sys
 from typing import Any, Callable, Dict, Iterable, Iterator, Tuple
+import warnings
 
 import torch
 import torch.utils.data
@@ -130,7 +131,6 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
         self.metrics_handler = metrics_handler if metrics_handler else metric.MetricsHandler([])
         self.device = device
         self.output_dir = output_dir
@@ -139,6 +139,11 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         if self.device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+
+        if use_amp and self.device.type != "cuda":
+            warnings.warn("Amp is only available for cuda devices. Amp will not be used.")
+            use_amp = False
+        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         os.makedirs(os.path.join(self.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "logs"), exist_ok=True)
