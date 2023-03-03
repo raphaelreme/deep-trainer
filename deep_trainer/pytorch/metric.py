@@ -67,7 +67,7 @@ class Metric:
         minimize (bool): Should the metric be minimized or maximized
     """
 
-    def __init__(self, display_name: str = None, train: bool = True, evaluate: bool = True, minimize=True):
+    def __init__(self, display_name: Optional[str] = None, train: bool = True, evaluate: bool = True, minimize=True):
         self.prerequisites: Set[Prerequisite] = set()
         self.last_value = float("nan")
         self.display_name = display_name if display_name else self.__class__.__name__
@@ -236,7 +236,7 @@ class PytorchMetric(Metric):
     def __init__(
         self,
         loss_function: Callable,
-        display_name: str = None,
+        display_name: Optional[str] = None,
         train: bool = True,
         evaluate: bool = True,
         minimize: bool = True,

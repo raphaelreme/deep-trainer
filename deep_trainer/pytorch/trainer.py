@@ -3,7 +3,7 @@
 import math
 import os
 import sys
-from typing import Any, Callable, Dict, Iterable, Iterator, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 import warnings
 
 import torch
@@ -88,10 +88,10 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler._LRScheduler = None,
-        metrics_handler: metric.MetricsHandler = None,
-        device: torch.device = None,
-        logger: logging.TrainLogger = None,
+        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+        metrics_handler: Optional[metric.MetricsHandler] = None,
+        device: Optional[torch.device] = None,
+        logger: Optional[logging.TrainLogger] = None,
         output_dir: str = "./experiments",
         save_mode: str = "never",
         use_amp: bool = False,
@@ -351,7 +351,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         epochs: int,
         train_loader: torch.utils.data.DataLoader,
         criterion: Callable,
-        val_loader: torch.utils.data.DataLoader = None,
+        val_loader: Optional[torch.utils.data.DataLoader] = None,
         epoch_size: int = 0,
     ) -> "PytorchTrainer":
         """Train the model

@@ -5,7 +5,7 @@ You can create your own logger class following these examples.
 By default the TensorBoard logger is used.
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch.utils.tensorboard
 
@@ -41,7 +41,7 @@ class DictLogger(TrainLogger):
     A reference to the dict is kept in `logs` attribute. You can access the logs through it.
     """
 
-    def __init__(self, logs: Dict[str, Tuple[List[int], List[float]]] = None):
+    def __init__(self, logs: Optional[Dict[str, Tuple[List[int], List[float]]]] = None):
         super().__init__()
         if logs is None:
             self.logs = {}
