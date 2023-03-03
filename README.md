@@ -1,5 +1,7 @@
 # deep-trainer
 
+[![Lint and Test](https://github.com/raphaelreme/deep-trainer/actions/workflows/tests.yml/badge.svg)](https://github.com/raphaelreme/deep-trainer/actions/workflows/tests.yml)
+
 Baseline code to train deep neural networks.
 Currently only available for PyTorch Framework.
 
