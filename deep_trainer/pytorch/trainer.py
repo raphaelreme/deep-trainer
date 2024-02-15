@@ -8,7 +8,7 @@ import warnings
 
 import torch
 import torch.utils.data
-import tqdm  # type: ignore
+import tqdm.auto as tqdm
 
 from . import logging
 from . import metric
