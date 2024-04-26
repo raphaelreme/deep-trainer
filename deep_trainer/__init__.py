@@ -7,4 +7,4 @@ from .pytorch.metric import Metric
 from .pytorch.logging import TrainLogger
 from .pytorch.trainer import PytorchTrainer
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
