@@ -60,7 +60,7 @@ trainer.evaluate(test_loader, criterion)
 
 ## Example
 
-`example/example.py` show how to train a PreActResNet with Deep Trainer.
+`example/example.py` shows how to train a PreActResNet with Deep Trainer.
 
 Install the additional requirements and use it with:
 
@@ -75,13 +75,4 @@ $ # Once done (or during the training), look for default tensorboard logs
 $ tensorboard --logdir experiments/logs/
 ```
 
-This script is reaching around 94-95% accuracy on validation with Cifar10 and a PreActResNet18.<br>
-Here are the [training logs](https://tensorboard.dev/experiment/lYN73lSpSm66bddAswIpOw):
-
-
-## Build and Deploy
-
-```bash
-$ python -m build
-$ python -m twine upload dist/*
-```
+This script is reaching around 94-95% accuracy on validation with Cifar10 and a PreActResNet18.

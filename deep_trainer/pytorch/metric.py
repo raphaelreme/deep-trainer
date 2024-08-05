@@ -40,15 +40,6 @@ class Prerequisite:
         """Reset the prerequisite"""
         raise NotImplementedError()
 
-    def __lt__(self, other) -> bool:
-        """Used to sort prerequisites.
-
-        Circular dependencies are ignored by `sorted` and will yield the best order possible
-        """
-        if isinstance(other, Prerequisite):
-            return self in other.prerequisites
-        return NotImplemented
-
 
 class Metric:
     """Base class for metric to be tracked during training.
@@ -119,23 +110,39 @@ class MetricsHandler:
         return filter(func, self.metrics)
 
     @staticmethod
-    def build_prerequisites_set(metrics: Iterable[Metric]) -> Set[Prerequisite]:
-        """Build all prerequisites from a list of metrics"""
-        prerequisites = set()
+    def build_prerequisites(metrics: Iterable[Metric]) -> List[Prerequisite]:
+        """Build all prerequisites from a list of metrics in a sorted order
 
-        def _rec_update(prerequisite: Prerequisite):
-            if prerequisite in prerequisites:
+        It will build a topological sort from leaf prerequisite to metrics.
+        """
+        # The sorting implementation is probably sub-optimal, but we rarely needs to sort more than
+        # 10 prerequisites, so this will do fine
+        # Will not detect circular dependencies
+        seen = set()
+        sorted_prerequisites: List[Prerequisite] = []
+
+        def _rec_update(prerequisite: Prerequisite, parent: Optional[Prerequisite] = None):
+            if prerequisite in seen:
                 return
 
-            prerequisites.add(prerequisite)
+            seen.add(prerequisite)
+            if parent is not None:
+                # We add just before its first parent
+                # Potential other parents can be added later and therefore
+                # will always be after in the list
+                sorted_prerequisites.insert(sorted_prerequisites.index(parent), prerequisite)
+            else:
+                # If no parent, we add at the end
+                sorted_prerequisites.append(prerequisite)
+
             for other in prerequisite.prerequisites:
-                _rec_update(other)
+                _rec_update(other, prerequisite)
 
         for metric in metrics:
             for prerequisite in metric.prerequisites:
                 _rec_update(prerequisite)
 
-        return prerequisites
+        return sorted_prerequisites
 
     def train(self, training: bool = True) -> None:
         """Switch to train metrics
@@ -186,7 +193,7 @@ class MetricsHandler:
             batch (Any): Batch used for outputs computation. Probably contains labels
             outputs (Any): Output of the model
         """
-        for prerequisite in sorted(self.build_prerequisites_set(self.current_metrics())):
+        for prerequisite in self.build_prerequisites(self.current_metrics()):
             prerequisite.update(batch, outputs)
 
         for metric in self.current_metrics():
@@ -206,7 +213,7 @@ class MetricsHandler:
     def aggregated_values(self) -> Dict[str, float]:
         """Dict of aggregated metrics"""
 
-        for prerequisite in sorted(self.build_prerequisites_set(self.current_metrics())):
+        for prerequisite in self.build_prerequisites(self.current_metrics()):
             prerequisite.aggregate()
 
         values = {}
@@ -219,7 +226,7 @@ class MetricsHandler:
     def reset(self) -> None:
         """Reset all the metrics and prerequisites"""
 
-        for prerequisites in self.build_prerequisites_set(self.metrics):
+        for prerequisites in self.build_prerequisites(self.metrics):
             prerequisites.reset()
 
         for metric in self.metrics:
@@ -355,7 +362,7 @@ class BalancedAccuracy(Metric):
 class ConfusionMatrix(Prerequisite):
     """Compute a confusion matrix as a prerequisite (Multiclass classification)"""
 
-    def __init__(self, k) -> None:
+    def __init__(self, k: int) -> None:
         super().__init__()
         self.k = k
         self.confusion_matrix = torch.zeros((k, k))
