@@ -240,7 +240,7 @@ class MetricsHandler:
 class PytorchMetric(Metric):
     """Average a pytorch loss function"""
 
-    def __init__(
+    def __init__(  # pylint: disable=unknown-option-value,too-many-positional-arguments
         self,
         loss_function: Callable,
         display_name: Optional[str] = None,

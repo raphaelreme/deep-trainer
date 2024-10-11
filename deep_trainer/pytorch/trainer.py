@@ -84,7 +84,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
     train_avg_name = "Avg Train Metrics"
     eval_avg_name = "Avg Eval Metrics "
 
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(  # pylint: disable=unknown-option-value,too-many-positional-arguments,too-many-arguments
         self,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
@@ -346,7 +346,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         if self.save_mode in ("small", "all"):
             self.save("best.ckpt")
 
-    def train(
+    def train(  # pylint: disable=unknown-option-value,too-many-positional-arguments
         self,
         epochs: int,
         train_loader: torch.utils.data.DataLoader,
