@@ -4,7 +4,6 @@ import math
 import os
 import sys
 from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
-import warnings
 
 import torch
 import torch.utils.data
@@ -132,18 +131,15 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.metrics_handler = metrics_handler if metrics_handler else metric.MetricsHandler([])
-        self.device = device
         self.output_dir = output_dir
         self.save_mode = save_mode
 
-        if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        if use_amp and self.device.type != "cuda":
-            warnings.warn("Amp is only available for cuda devices. Amp will not be used.")
-            use_amp = False
-        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        self.device = device
+        self.model.to(self.device)
+        self.scaler = torch.GradScaler(self.device.type, enabled=use_amp)
 
         os.makedirs(os.path.join(self.output_dir, "checkpoints"), exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "logs"), exist_ok=True)
@@ -221,7 +217,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
 
-        # XXX: torch.cuda.amp.GradScaler does not provide any way to check whether the step is skipped
+        # XXX: torch.GradScaler does not provide any way to check whether the step is skipped
         # We could check some internal stuff like _found_inf_per_device but let's just check whether
         # scale has halved after the scaler update.
         previous_scale = self.scaler.get_scale()
@@ -255,7 +251,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         """
         inputs, targets = self.process_train_batch(batch)
 
-        with torch.cuda.amp.autocast(self.use_amp):
+        with torch.autocast(self.device.type, enabled=self.use_amp):
             predictions = self.model(inputs)
             loss: torch.Tensor = criterion(predictions, targets)
             self.metrics_handler.update((inputs, targets), predictions.detach())
@@ -279,7 +275,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         """
         inputs, targets = self.process_eval_batch(batch)
 
-        with torch.cuda.amp.autocast(self.use_amp):
+        with torch.autocast(self.device.type, enabled=self.use_amp):
             predictions = self.model(inputs)
             self.metrics_handler.update((inputs, targets), predictions)
 
