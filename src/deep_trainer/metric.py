@@ -1,15 +1,26 @@
-"""Metrics used for training and evaluation procedure
+"""Metrics used for training and evaluation.
 
-Provide some examples of useful metrics for classification
+Provide the API and some examples of useful metrics for classification.
 """
 
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from __future__ import annotations
+
+import sys
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
+if sys.version_info < (3, 12):
+    from typing_extensions import override
+else:
+    from typing import override
+
 
 class Prerequisite:
-    """A common code to run before some metrics that can be shared between metrics
+    """A common code to run before some metrics that can be shared between metrics.
 
     The idea is that some metrics can define prerequisites (shared between metrics)
     Each prerequisite can also have its own prerequisites. The metrics handler will first
@@ -21,24 +32,24 @@ class Prerequisite:
     """
 
     def __init__(self) -> None:
-        self.prerequisites: Set[Prerequisite] = set()
+        self.prerequisites: set[Prerequisite] = set()
 
-    def update(self, batch: Any, outputs: Any) -> None:
-        """Update the prerequisite with the current batch
+    def update(self, batch, outputs) -> None:
+        """Update the prerequisite with the current batch.
 
         Args:
             batch (Any): Batch used for outputs computation. Probably contains labels
             outputs (Any): Output of the model
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def aggregate(self) -> None:
-        """Aggregate the prerequisite"""
-        raise NotImplementedError()
+        """Aggregate the prerequisite."""
+        raise NotImplementedError
 
     def reset(self) -> None:
-        """Reset the prerequisite"""
-        raise NotImplementedError()
+        """Reset the prerequisite."""
+        raise NotImplementedError
 
 
 class Metric:
@@ -47,8 +58,8 @@ class Metric:
     A metric is updated at each batch, and can be aggregated whenever it is necessary.
     A last value can be accessed. But for some metrics it will not make sense and NaN can be returned
 
-    Attr:
-        prerequisites (Set[Prerequisite]): Prerequisites to update and aggregate before this metric
+    Attributes:
+        prerequisites (set[Prerequisite]): Prerequisites to update and aggregate before this metric
             Prerequisites are updated by the MetricsHandler class. If you use prerequisites without a metrics handler
             you should update them manually.
         last_value (float): Value of the metric on the last update (can be NaN)
@@ -58,17 +69,18 @@ class Metric:
         minimize (bool): Should the metric be minimized or maximized
     """
 
-    def __init__(self, display_name: Optional[str] = None, train: bool = True, evaluate: bool = True, minimize=True):
-        self.prerequisites: Set[Prerequisite] = set()
+    def __init__(self, display_name: str | None = None, train: bool = True, evaluate: bool = True, minimize=True):
+        self.prerequisites: set[Prerequisite] = set()
         self.last_value = float("nan")
-        self.display_name = display_name if display_name else self.__class__.__name__
+        self.display_name = display_name or self.__class__.__name__
         self.train = train
         self.evaluate = evaluate
         self.minimize = minimize
 
-    def update(self, batch: Any, outputs: Any) -> None:
-        """Update the metric with the current batch, and set the metric last_value for this
-        particular batch if this makes sense.
+    def update(self, batch, outputs) -> None:
+        """Update the metric with the current batch.
+
+        It will set the metric last_value for this particular batch if the metric can be computed per batch.
 
         Args:
             batch (Any): Batch used for outputs computation. Probably contains labels
@@ -90,28 +102,28 @@ class Metric:
 
 
 class MetricsHandler:
-    """Handle a given list of metrics"""
+    """Handle a given list of metrics."""
 
-    def __init__(self, metrics: List[Metric]):
+    def __init__(self, metrics: list[Metric]):
         self.training = True
         self.metrics = metrics
-        self._validation_metric: Optional[Metric] = None
+        self._validation_metric: Metric | None = None
 
     def current_metrics(self) -> Iterator[Metric]:
-        """Return an iterator on the current metrics
+        """Return an iterator on the current metrics.
 
         Returns:
             Iterator[Metric]: Metric to use in the current mode
         """
 
         def func(metric: Metric) -> bool:
-            return self.training and metric.train or not self.training and metric.evaluate
+            return (self.training and metric.train) or (not self.training and metric.evaluate)
 
         return filter(func, self.metrics)
 
     @staticmethod
-    def build_prerequisites(metrics: Iterable[Metric]) -> List[Prerequisite]:
-        """Build all prerequisites from a list of metrics in a sorted order
+    def build_prerequisites(metrics: Iterable[Metric]) -> list[Prerequisite]:
+        """Build all prerequisites from a list of metrics in a sorted order.
 
         It will build a topological sort from leaf prerequisite to metrics.
         """
@@ -119,9 +131,9 @@ class MetricsHandler:
         # 10 prerequisites, so this will do fine
         # Will not detect circular dependencies
         seen = set()
-        sorted_prerequisites: List[Prerequisite] = []
+        sorted_prerequisites: list[Prerequisite] = []
 
-        def _rec_update(prerequisite: Prerequisite, parent: Optional[Prerequisite] = None):
+        def _rec_update(prerequisite: Prerequisite, parent: Prerequisite | None = None) -> None:
             if prerequisite in seen:
                 return
 
@@ -145,7 +157,7 @@ class MetricsHandler:
         return sorted_prerequisites
 
     def train(self, training: bool = True) -> None:
-        """Switch to train metrics
+        """Switch to training metrics.
 
         Args:
             training (bool): Switch to train if True or to eval if False
@@ -153,11 +165,11 @@ class MetricsHandler:
         self.training = training
 
     def eval(self) -> None:
-        """Switch to evaluate metrics"""
+        """Switch to evaluation metrics."""
         self.train(False)
 
-    def get_validation_metric(self) -> Optional[Metric]:
-        """Get the validation metric
+    def get_validation_metric(self) -> Metric | None:
+        """Get the validation metric.
 
         Returns None if not set.
 
@@ -167,7 +179,7 @@ class MetricsHandler:
         return self._validation_metric
 
     def set_validation_metric(self, index: int) -> None:
-        """Select a validation metric
+        """Select a validation metric.
 
         Without validation metric, the train criterion is used by default to validate training.
 
@@ -178,8 +190,8 @@ class MetricsHandler:
             raise ValueError(f"Metric {self.metrics[index]} at {index} is not in evaluate mode")
         self._validation_metric = self.metrics[index]
 
-    def update(self, batch: Any, outputs: Any) -> None:
-        """Update all the metrics for the current mode
+    def update(self, batch, outputs) -> None:
+        """Update all the metrics for the current mode.
 
         For a more finegrained control, each metric can be updated on its own.
 
@@ -200,8 +212,8 @@ class MetricsHandler:
             metric.update(batch, outputs)
 
     @property
-    def last_values(self) -> Dict[str, float]:
-        """Dict of last computed metrics"""
+    def last_values(self) -> dict[str, float]:
+        """Dict of last computed metrics."""
         values = {}
 
         for metric in self.current_metrics():
@@ -210,9 +222,8 @@ class MetricsHandler:
         return values
 
     @property
-    def aggregated_values(self) -> Dict[str, float]:
-        """Dict of aggregated metrics"""
-
+    def aggregated_values(self) -> dict[str, float]:
+        """Dict of aggregated metrics."""
         for prerequisite in self.build_prerequisites(self.current_metrics()):
             prerequisite.aggregate()
 
@@ -224,8 +235,7 @@ class MetricsHandler:
         return values
 
     def reset(self) -> None:
-        """Reset all the metrics and prerequisites"""
-
+        """Reset all the metrics and prerequisites."""
         for prerequisites in self.build_prerequisites(self.metrics):
             prerequisites.reset()
 
@@ -233,30 +243,32 @@ class MetricsHandler:
             metric.reset()
 
     def __iter__(self):
+        """Iterate on the active metrics."""
         return self.current_metrics()
 
 
 # Some metrics examples
 class PytorchMetric(Metric):
-    """Average a pytorch loss function"""
+    """Average a pytorch loss function."""
 
-    def __init__(  # pylint: disable=unknown-option-value,too-many-positional-arguments
+    def __init__(
         self,
-        loss_function: Callable,
-        display_name: Optional[str] = None,
+        loss_function: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        display_name: str | None = None,
         train: bool = True,
         evaluate: bool = True,
         minimize: bool = True,
     ):
         if display_name is None:
-            display_name = getattr(loss_function, "__name__", getattr(loss_function, "__class__").__name__)
+            display_name = getattr(loss_function, "__name__", loss_function.__class__.__name__)
 
         super().__init__(display_name=display_name, train=train, evaluate=evaluate, minimize=minimize)
         self.loss_function = loss_function
-        self._sum = 0
+        self._sum = 0.0
         self._n_samples = 0
 
-    def update(self, batch: Tuple[torch.Tensor, torch.Tensor], outputs: torch.Tensor) -> None:
+    @override
+    def update(self, batch: tuple[Any, torch.Tensor], outputs: torch.Tensor) -> None:
         _, targets = batch
 
         loss = self.loss_function(outputs, targets)
@@ -265,9 +277,11 @@ class PytorchMetric(Metric):
         self._n_samples += batch_size
         self.last_value = loss.item()
 
+    @override
     def aggregate(self) -> float:
         return self._sum / self._n_samples
 
+    @override
     def reset(self) -> None:
         super().reset()
         self._sum = 0
@@ -320,7 +334,7 @@ class TopK(PytorchMetric):
 
 
 class BalancedAccuracy(Metric):
-    """Balanced Accuracy Metric
+    """Balanced Accuracy Metric.
 
     Compute the Balanced Accuracy of the predictions. <=> Average the recall of each target.
     This criterion has meaning only at aggregation time.
@@ -330,65 +344,72 @@ class BalancedAccuracy(Metric):
 
     def __init__(self, train: bool = True, evaluate: bool = True):
         super().__init__("BalancedAccuracy", train, evaluate, False)
-        self.target_occurences: Dict[int, int] = {}
-        self.true_positives: Dict[int, int] = {}
+        self.target_occurrences: dict[int, int] = {}
+        self.true_positives: dict[int, int] = {}
 
-    def update(self, batch: Tuple[torch.Tensor, torch.Tensor], outputs: torch.Tensor) -> None:
+    @override
+    def update(self, batch: tuple[Any, torch.Tensor], outputs: torch.Tensor) -> None:
         _, targets = batch
 
         predicted_targets = torch.argmax(outputs, dim=1)
 
-        assert predicted_targets.shape == targets.shape
-        assert len(predicted_targets.shape) == 1
+        if predicted_targets.shape != targets.shape or len(predicted_targets.shape) != 1:
+            raise ValueError(f"Wrong predicted targets shape: {predicted_targets.shape}. Expected {(len(targets),)}.")
 
         for i in range(predicted_targets.shape[0]):
-            target: int = targets[i].item()  # type: ignore
-            predicted: int = predicted_targets[i].item()  # type: ignore
+            target = int(targets[i].item())
+            predicted = int(predicted_targets[i].item())
 
-            self.target_occurences[target] = self.target_occurences.get(target, 0) + 1
+            self.target_occurrences[target] = self.target_occurrences.get(target, 0) + 1
             self.true_positives[target] = self.true_positives.get(target, 0) + (target == predicted)
 
+    @override
     def aggregate(self) -> float:
-        recall = [self.true_positives[target] / occurence for target, occurence in self.target_occurences.items()]
+        recall = [self.true_positives[target] / occurrence for target, occurrence in self.target_occurrences.items()]
         return sum(recall) / len(recall)
 
+    @override
     def reset(self) -> None:
         super().reset()
-        self.target_occurences = {}
+        self.target_occurrences = {}
         self.true_positives = {}
 
 
 # Examples of metrics with prerequisite
 class ConfusionMatrix(Prerequisite):
-    """Compute a confusion matrix as a prerequisite (Multiclass classification)"""
+    """Compute a confusion matrix as a prerequisite (Multiclass classification)."""
 
     def __init__(self, k: int) -> None:
         super().__init__()
         self.k = k
         self.confusion_matrix = torch.zeros((k, k))
 
-    def update(self, batch: Tuple[torch.Tensor, torch.Tensor], outputs: torch.Tensor) -> None:
+    @override
+    def update(self, batch: tuple[Any, torch.Tensor], outputs: torch.Tensor) -> None:
         _, targets = batch
 
         predicted_targets = torch.argmax(outputs, dim=1)
 
-        assert predicted_targets.shape == targets.shape
+        if predicted_targets.shape != targets.shape:
+            raise ValueError(f"Wrong predicted targets shape: {predicted_targets.shape}. Expected {targets.shape}")
 
         for i in range(predicted_targets.shape[0]):
-            target: int = targets[i].item()  # type: ignore
-            predicted: int = predicted_targets[i].item()  # type: ignore
+            target = int(targets[i].item())
+            predicted = int(predicted_targets[i].item())
 
             self.confusion_matrix[target, predicted] += 1
 
+    @override
     def aggregate(self) -> None:
         pass  # Nothing to do
 
+    @override
     def reset(self):
         self.confusion_matrix = torch.zeros((self.k, self.k))
 
 
 class Recall(Metric):
-    """Compute Recall from ConfusionMatrix prerequisite (Multiclass classification)
+    """Compute Recall from ConfusionMatrix prerequisite (Multiclass classification).
 
     Equivalent to BalancedAccuracy in the 'macro' setting.
     """
@@ -396,11 +417,11 @@ class Recall(Metric):
     def __init__(
         self, confusion_prerequisite: ConfusionMatrix, average="macro", train: bool = True, evaluate: bool = True
     ):
-        """Constructor
+        """Constructor.
 
         Args:
             confusion_prerequisite (ConfusionMatrix): Prerequisite needed to compute this metric
-            average ("macro" | "weigthed"): Aggregation method of the score (Similar to sklearn)
+            average ("macro" | "weighted"): Aggregation method of the score (Similar to sklearn)
                 'macro': Calculate metrics for each label, and find their unweighted mean.
                     This does not take label imbalance into account.
                 'weighted': Calculate metrics for each label, and find their weighted mean.
@@ -412,44 +433,47 @@ class Recall(Metric):
         self.prerequisites.add(confusion_prerequisite)
         self.confusion_matrix = confusion_prerequisite
 
-        assert average in {"macro", "weighted"}  # Micro from sklearn is equivalent to accuracy. Let's not use it
+        if average not in {"macro", "weighted"}:  # Micro from sklearn is equivalent to accuracy. Let's not use it
+            raise ValueError(f"`average` should be in ['macro', 'weighted']. Found {average}")
         self.average = average
 
-    def update(self, batch: Any, outputs: Any) -> None:
+    @override
+    def update(self, batch: tuple[Any, torch.Tensor], outputs: torch.Tensor) -> None:
         pass  # All is done in the confusion prerequisite
 
+    @override
     def aggregate(self) -> float:
         confusion_matrix = self.confusion_matrix.confusion_matrix
 
-        target_occurences = confusion_matrix.sum(dim=1)
+        target_occurrences = confusion_matrix.sum(dim=1)
         true_positives = confusion_matrix.diag()
 
         # Only use targets with at least one sample
-        valid_targets = target_occurences != 0
-        target_occurences = target_occurences[valid_targets]
+        valid_targets = target_occurrences != 0
+        target_occurrences = target_occurrences[valid_targets]
         true_positives = true_positives[valid_targets]
 
         if self.average == "macro":
-            return torch.mean(true_positives / target_occurences).item()
+            return torch.mean(true_positives / target_occurrences).item()
 
         # weighted
-        # recalls = tps / occurences
-        # weighted_avg_recall = sum(recalls * occurences / total)
-        #                     = sum(tps / total) = sum(tps) / total
-        return (true_positives.sum() / target_occurences.sum()).item()
+        # >> recalls = tps / occurrences
+        # >> weighted_avg_recall = sum(recalls * occurrences / total)
+        # >>                     = sum(tps / total) = sum(tps) / total
+        return (true_positives.sum() / target_occurrences.sum()).item()
 
 
 class Precision(Metric):
-    """Compute Precision from ConfusionMatrix prerequisite (Multiclass classification)"""
+    """Compute Precision from ConfusionMatrix prerequisite (Multiclass classification)."""
 
     def __init__(
         self, confusion_prerequisite: ConfusionMatrix, average="macro", train: bool = True, evaluate: bool = True
     ):
-        """Constructor
+        """Constructor.
 
         Args:
             confusion_prerequisite (ConfusionMatrix): Prerequisite needed to compute this metric
-            average ("macro" | "weigthed"): Aggregation method of the score (Similar to sklearn)
+            average ("macro" | "weighted"): Aggregation method of the score (Similar to sklearn)
                 'macro': Calculate metrics for each label, and find their unweighted mean.
                     This does not take label imbalance into account.
                 'weighted': Calculate metrics for each label, and find their weighted mean.
@@ -461,46 +485,49 @@ class Precision(Metric):
         self.prerequisites.add(confusion_prerequisite)
         self.confusion_matrix = confusion_prerequisite
 
-        assert average in {"macro", "weighted"}  # Micro from sklearn is equivalent to accuracy. Let's not use it
+        if average not in {"macro", "weighted"}:  # Micro from sklearn is equivalent to accuracy. Let's not use it
+            raise ValueError(f"`average` should be in ['macro', 'weighted']. Found {average}")
         self.average = average
 
-    def update(self, batch: Any, outputs: Any) -> None:
+    @override
+    def update(self, batch: tuple[Any, torch.Tensor], outputs: torch.Tensor) -> None:
         pass  # All is done in the confusion prerequisite
 
+    @override
     def aggregate(self) -> float:
         confusion_matrix = self.confusion_matrix.confusion_matrix
 
-        target_occurences = confusion_matrix.sum(dim=1)
-        prediction_occurences = confusion_matrix.sum(dim=0)
+        target_occurrences = confusion_matrix.sum(dim=1)
+        prediction_occurrences = confusion_matrix.sum(dim=0)
         true_positives = confusion_matrix.diag()
 
         # Only keep targets with at least a prediction or a true sample
-        valid_targets = (target_occurences + prediction_occurences) != 0
-        target_occurences = target_occurences[valid_targets]
-        prediction_occurences = prediction_occurences[valid_targets]
+        valid_targets = (target_occurrences + prediction_occurrences) != 0
+        target_occurrences = target_occurrences[valid_targets]
+        prediction_occurrences = prediction_occurrences[valid_targets]
         true_positives = true_positives[valid_targets]
 
-        precisions = true_positives / prediction_occurences
-        precisions[prediction_occurences == 0] = 0  # If no prediction, then the precision is 0.
+        precisions = true_positives / prediction_occurrences
+        precisions[prediction_occurrences == 0] = 0  # If no prediction, then the precision is 0.
 
         if self.average == "macro":
             return precisions.mean().item()
 
         # weighted
-        return (torch.sum(precisions * target_occurences) / target_occurences.sum()).item()
+        return (torch.sum(precisions * target_occurrences) / target_occurrences.sum()).item()
 
 
 class F1(Metric):
-    """Compute F1 score from ConfusionMatrix prerequisite (Multiclass classification)"""
+    """Compute F1 score from ConfusionMatrix prerequisite (Multiclass classification)."""
 
     def __init__(
         self, confusion_prerequisite: ConfusionMatrix, average="macro", train: bool = True, evaluate: bool = True
     ):
-        """Constructor
+        """Constructor.
 
         Args:
             confusion_prerequisite (ConfusionMatrix): Prerequisite needed to compute this metric
-            average ("macro" | "weigthed"): Aggregation method of the score (Similar to sklearn)
+            average ("macro" | "weighted"): Aggregation method of the score (Similar to sklearn)
                 'macro': Calculate metrics for each label, and find their unweighted mean.
                     This does not take label imbalance into account.
                 'weighted': Calculate metrics for each label, and find their weighted mean.
@@ -512,34 +539,37 @@ class F1(Metric):
         self.prerequisites.add(confusion_prerequisite)
         self.confusion_matrix = confusion_prerequisite
 
-        assert average in {"macro", "weighted"}
+        if average not in {"macro", "weighted"}:  # Micro from sklearn is equivalent to accuracy. Let's not use it
+            raise ValueError(f"`average` should be in ['macro', 'weighted']. Found {average}")
         self.average = average
 
-    def update(self, batch: Any, outputs: Any) -> None:
+    @override
+    def update(self, batch: tuple[Any, torch.Tensor], outputs: torch.Tensor) -> None:
         pass  # All is done in the confusion prerequisite
 
+    @override
     def aggregate(self) -> float:
         confusion_matrix = self.confusion_matrix.confusion_matrix
 
-        target_occurences = confusion_matrix.sum(dim=1)
-        prediction_occurences = confusion_matrix.sum(dim=0)
+        target_occurrences = confusion_matrix.sum(dim=1)
+        prediction_occurrences = confusion_matrix.sum(dim=0)
         true_positives = confusion_matrix.diag()
 
         # Only keep targets with at least a true sample
-        valid_targets = target_occurences != 0
-        if prediction_occurences[~valid_targets].sum() != 0:
+        valid_targets = target_occurrences != 0
+        if prediction_occurrences[~valid_targets].sum() != 0:
             raise ValueError(
                 "Cannot compute recall for targets without any sample."
                 "And unable to ignore some of these targets as they are predicted"
             )
-        target_occurences = target_occurences[valid_targets]
-        prediction_occurences = prediction_occurences[valid_targets]
+        target_occurrences = target_occurrences[valid_targets]
+        prediction_occurrences = prediction_occurrences[valid_targets]
         true_positives = true_positives[valid_targets]
 
-        precisions = true_positives / prediction_occurences
-        precisions[prediction_occurences == 0] = 0  # If no prediction, then the precision is 0.
+        precisions = true_positives / prediction_occurrences
+        precisions[prediction_occurrences == 0] = 0  # If no prediction, then the precision is 0.
 
-        recalls = true_positives / target_occurences
+        recalls = true_positives / target_occurrences
 
         f1_score = 2 / (1 / precisions + 1 / recalls)  # Do not use prec * rec / (prec + rec) as it can yields nan
 
@@ -547,4 +577,4 @@ class F1(Metric):
             return f1_score.mean().item()
 
         # weighted
-        return (torch.sum(f1_score * target_occurences) / target_occurences.sum()).item()
+        return (torch.sum(f1_score * target_occurrences) / target_occurrences.sum()).item()

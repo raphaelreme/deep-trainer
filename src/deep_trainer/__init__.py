@@ -1,4 +1,4 @@
-"""Deep Trainer
+"""Deep Trainer.
 
 Helps you train your deep learning models in PyTorch
 
@@ -44,8 +44,10 @@ trainer.evaluate(test_loader, criterion)
 
 """
 
-from .pytorch.metric import Metric
-from .pytorch.logging import TrainLogger
-from .pytorch.trainer import PytorchTrainer
+from .logging import TrainLogger
+from .metric import Metric
+from .trainer import PytorchTrainer
+
+__all__ = ["Metric", "PytorchTrainer", "TrainLogger"]
 
 __version__ = "0.1.7"

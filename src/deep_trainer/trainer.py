@@ -1,24 +1,30 @@
 """Provide the Trainer Class for PyTorch."""
 
+from __future__ import annotations
+
 import math
-import os
+import pathlib
 import sys
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
+import warnings
+from typing import TYPE_CHECKING
 
 import torch
 import torch.utils.data
 import tqdm.auto as tqdm
 
-from . import logging
-from . import metric
+from . import logging, metric
 
+if TYPE_CHECKING:
+    import os
+    from collections.abc import Callable, Generator, Iterable, Iterator
 
 # TODO: Avg Losses assume that the batches are evenly sized. (was solved before but not anymore)
 # TODO: Log instead of print for epochs + time monitoring (Split data time vs Model time ?)
+# TODO: Split the class into a abstract class + an implementation for classification?
 
 
 def round_to_n(x: float, n_digits: int) -> float:
-    """Round a floating point to n significant digits
+    """Round a floating point to n significant digits.
 
     Args:
         x (float): Number to round
@@ -33,8 +39,8 @@ def round_to_n(x: float, n_digits: int) -> float:
     return round(x, -main_digit + n_digits - 1)
 
 
-def build_description(name: str, metrics: Dict[str, float]) -> str:
-    """Create a description string from a name and some metrics
+def build_description(name: str, metrics: dict[str, float]) -> str:
+    """Create a description string from a name and some metrics.
 
     Args:
         name (str): Main name of the description
@@ -55,24 +61,24 @@ def build_description(name: str, metrics: Dict[str, float]) -> str:
     return desc
 
 
-def cyclic_iterator(iterable: Iterable):
-    """Build a infinite cyclic iterator over an iterable
+def cyclic_iterator(iterable: Iterable) -> Generator:
+    """Build a infinite cyclic iterator over an iterable.
 
     Different from `itertools.cycle`: It does not try to keep the first iteration in memory
     (heavy and we want to keep randomness in dataloaders)
 
     Args:
-        iterable (Iterable)
+        iterable (Iterable): Iterable to wrap
     """
     iterator = iter(iterable)
     while True:
         try:
             yield next(iterator)
-        except StopIteration:
+        except StopIteration:  # noqa: PERF203
             iterator = iter(iterable)
 
 
-class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
+class PytorchTrainer:
     """Base trainer for pytorch project.
 
     Wraps all the training procedures for a given model, optimizer and scheduler.
@@ -83,15 +89,15 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
     train_avg_name = "Avg Train Metrics"
     eval_avg_name = "Avg Eval Metrics "
 
-    def __init__(  # pylint: disable=unknown-option-value,too-many-positional-arguments,too-many-arguments
+    def __init__(  # noqa: PLR0913
         self,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-        metrics_handler: Optional[metric.MetricsHandler] = None,
-        device: Optional[torch.device] = None,
-        logger: Optional[logging.TrainLogger] = None,
-        output_dir: str = "./experiments",
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+        metrics_handler: metric.MetricsHandler | None = None,
+        device: torch.device | None = None,
+        logger: logging.TrainLogger | None = None,
+        output_dir: str | os.PathLike = "./experiments",
         save_mode: str = "never",
         use_amp: bool = False,
     ):
@@ -119,7 +125,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
                 (or cpu if cuda is not available)
                 TPU or Multi device training is not supported yet.
             logger (TrainLogger): Logger object. If not provided a default tensorboard logger will be created.
-            output_dir (str): output directory, where checkpoints, logs, [...] are saved
+            output_dir (str | os.PathLike): output directory, where checkpoints, logs, [...] are saved
             save_mode ("never"|"small"|"all"): Checkpointing mode (see `save` and `load`)
                 never: No checkpoint for this training
                 small: Keep only the best checkpoint 'best.ckpt' and the last checkpoint
@@ -130,8 +136,8 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.metrics_handler = metrics_handler if metrics_handler else metric.MetricsHandler([])
-        self.output_dir = output_dir
+        self.metrics_handler = metrics_handler or metric.MetricsHandler([])
+        self.output_dir = pathlib.Path(output_dir)
         self.save_mode = save_mode
 
         if device is None:
@@ -141,14 +147,14 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.model.to(self.device)
         self.scaler = torch.GradScaler(self.device.type, enabled=use_amp)
 
-        os.makedirs(os.path.join(self.output_dir, "checkpoints"), exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "logs"), exist_ok=True)
+        (self.output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (self.output_dir / "logs").mkdir(parents=True, exist_ok=True)
 
         self.logger: logging.TrainLogger
         if logger is not None:
             self.logger = logger
         else:
-            self.logger = logging.TensorBoardLogger(os.path.join(self.output_dir, "logs"))
+            self.logger = logging.TensorBoardLogger(str(self.output_dir / "logs"))  # TODO: Support for Path?
 
         self.train_steps = 0
         self.epoch = 0
@@ -158,16 +164,16 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
     @property
     def use_amp(self) -> bool:
-        """Whether the trainer is using amp or not"""
+        """Whether the trainer is using amp or not."""
         return self.scaler.is_enabled()
 
-    def _default_process_batch(self, batch: Any) -> Tuple[Any, Any]:
+    def _default_process_batch(self, batch) -> tuple:
         inputs, targets = batch
         inputs = inputs.to(self.device, non_blocking=True)
         targets = targets.to(self.device, non_blocking=True)
         return inputs, targets
 
-    def process_train_batch(self, batch: Any) -> Tuple[Any, Any]:
+    def process_train_batch(self, batch) -> tuple:
         """Process each training batch.
 
         Extract inputs for the model, targets for the loss, and batch size.
@@ -183,7 +189,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         """
         return self._default_process_batch(batch)
 
-    def process_eval_batch(self, batch: Any) -> Tuple[Any, Any]:
+    def process_eval_batch(self, batch) -> tuple:
         """Process each eval batch.
 
         Extract inputs for the model, targets for the loss, and batch size.
@@ -199,8 +205,8 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         """
         return self._default_process_batch(batch)
 
-    def backward(self, loss: torch.Tensor):
-        """Do the backpropagation step
+    def backward(self, loss: torch.Tensor) -> None:
+        """Do the backpropagation step.
 
         Called at each training steps with the computed loss, it handles:
           * The backward of the loss (to be scaled or not if use_amp)
@@ -209,10 +215,10 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         Should be overwritten for special behavior. Use the default implementation as an example.
         (For instance you could do gradient accumulation here)
 
-        For more complexe behavior you can avoid calling backward in the trainstep and handle everything yourself.
+        For more complex behavior you can avoid calling backward in the trainstep and handle everything yourself.
 
         Args:
-            loss (torch.Tensor)
+            loss (torch.Tensor): Loss for the current batch.
         """
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
@@ -225,11 +231,10 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        if previous_scale <= self.scaler.get_scale():  # Step not skipped
-            if self.scheduler:
-                self.scheduler.step()
+        if previous_scale <= self.scaler.get_scale() and self.scheduler:  # Step not skipped
+            self.scheduler.step()
 
-    def train_step(self, batch: Any, criterion: Callable) -> Dict[str, float]:
+    def train_step(self, batch, criterion: Callable[..., torch.Tensor]) -> dict[str, float]:
         """Perform a training step.
 
         Should be overwritten for special behaviors. The steps are:
@@ -237,15 +242,15 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             - Compute model outputs (By default: `self.model(inputs)`)
             - Compute loss using the criterion
             - Backward as needed (By default: `PytorchTrainer.backward` which will handle optimizer and scheduler steps)
-            - Update metrics (if needed) and returns a dictionnary of metrics with a "Loss" entry
+            - Update metrics (if needed) and return a dictionary of metrics with a "Loss" entry
 
         Args:
             batch (Any): The batch from the train loader
-            criterion (Callable): Loss function given to the train method.
+            criterion (Callable[[Any, Any], torch.Tensor]): Loss function given to the train method.
                 See `PytorchTrainer.train` documentation.
 
         Returns:
-            Dict[str, float]: Evaluation of metrics on this batch
+            dict[str, float]: Evaluation of metrics on this batch
                 Should contain a "Loss" entry.
                 All the items (one by metric by default), will be logged
         """
@@ -253,7 +258,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         with torch.autocast(self.device.type, enabled=self.use_amp):
             predictions = self.model(inputs)
-            loss: torch.Tensor = criterion(predictions, targets)
+            loss = criterion(predictions, targets)
             self.metrics_handler.update((inputs, targets), predictions.detach())
 
         self.backward(loss)
@@ -263,14 +268,14 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         return metrics
 
-    def eval_step(self, batch: Any) -> Dict[str, float]:
-        """Perform an evaluation step with the metrics
+    def eval_step(self, batch) -> dict[str, float]:
+        """Perform an evaluation step with the metrics.
 
         Args:
             batch (Any): Batch from the dataloader given to evaluate
 
         Returns:
-            Dict[str, float]: Evaluation of the metrics on this batch
+            dict[str, float]: Evaluation of the metrics on this batch
                 Should contain a "Loss" entry
         """
         inputs, targets = self.process_eval_batch(batch)
@@ -281,14 +286,16 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         return self.metrics_handler.last_values
 
-    def _single_epoch_train(self, train_iterator: Iterator, criterion: Callable, epoch_size: int) -> Dict[str, float]:
-        """Performs a single epoch training of the `train` method"""
+    def _single_epoch_train(
+        self, train_iterator: Iterator, criterion: Callable[..., torch.Tensor], epoch_size: int
+    ) -> dict[str, float]:
+        """Performs a single epoch training of the `train` method."""
         self.model.train()
         self.metrics_handler.train()
         self.metrics_handler.reset()
         metrics = self.metrics_handler.last_values
         metrics["Loss"] = float("nan")
-        cum_metrics: Dict[str, float] = {}
+        cum_metrics: dict[str, float] = {}
 
         progress_bar = tqdm.trange(epoch_size, file=sys.stdout)
         progress_bar.set_description(build_description(self.train_bar_name, metrics))
@@ -319,8 +326,8 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         return metrics
 
-    def _handle_validation_metrics(self, metrics: Dict[str, float]) -> None:
-        """Handle validation metrics
+    def _handle_validation_metrics(self, metrics: dict[str, float]) -> None:
+        """Handle validation metrics.
 
         If metrics are better, update best_val, best_epoch and save
         """
@@ -342,15 +349,15 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         if self.save_mode in ("small", "all"):
             self.save("best.ckpt")
 
-    def train(  # pylint: disable=unknown-option-value,too-many-positional-arguments
+    def train(
         self,
         epochs: int,
         train_loader: torch.utils.data.DataLoader,
-        criterion: Callable,
-        val_loader: Optional[torch.utils.data.DataLoader] = None,
+        criterion: Callable[..., torch.Tensor],
+        val_loader: torch.utils.data.DataLoader | None = None,
         epoch_size: int = 0,
-    ) -> "PytorchTrainer":
-        """Train the model
+    ) -> PytorchTrainer:
+        """Train the model.
 
         Note:
             If no validation metric is set in the metrics handler, then the criterion will be used
@@ -382,7 +389,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         train_iterator = cyclic_iterator(train_loader)
         while self.epoch < n_epochs:
-            print(f"Epoch {self.epoch + 1}/{n_epochs}")
+            print(f"Epoch {self.epoch + 1}/{n_epochs}")  # noqa: T201
             metrics = self._single_epoch_train(train_iterator, criterion, epoch_size)
             self.epoch += 1
 
@@ -397,12 +404,12 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
                 self._handle_validation_metrics(val_metrics)
 
-                print(build_description(self.train_avg_name.format(self.epoch, n_epochs), metrics), flush=True)
-                print(build_description(self.eval_avg_name.format(self.epoch, n_epochs), val_metrics), flush=True)
+                print(build_description(self.train_avg_name.format(self.epoch, n_epochs), metrics), flush=True)  # noqa: T201
+                print(build_description(self.eval_avg_name.format(self.epoch, n_epochs), val_metrics), flush=True)  # noqa: T201
             else:
-                print(build_description(self.train_avg_name.format(self.epoch, n_epochs), metrics), flush=True)
+                print(build_description(self.train_avg_name.format(self.epoch, n_epochs), metrics), flush=True)  # noqa: T201
 
-            print(flush=True)  # Let's jump a line
+            print(flush=True)  # Let's jump a line  # noqa: T201
 
             if self.save_mode in ("small", "all"):
                 self.save(f"{self.epoch}.ckpt")
@@ -412,12 +419,12 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         if no_validation_metric:
             self.metrics_handler.metrics.pop(0)
-            self.metrics_handler._validation_metric = None  # pylint: disable=protected-access
+            self.metrics_handler._validation_metric = None  # noqa: SLF001
 
         return self
 
-    def evaluate(self, dataloader: torch.utils.data.DataLoader) -> Dict[str, float]:
-        """Evaluate the current model with the metrics on the dataloader
+    def evaluate(self, dataloader: torch.utils.data.DataLoader) -> dict[str, float]:
+        """Evaluate the current model with the metrics on the dataloader.
 
         Args:
             dataloader (torch.utils.data.Dataloader): Dataloader over the dataset to evaluate
@@ -429,7 +436,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         self.metrics_handler.eval()
         self.metrics_handler.reset()
         metrics = self.metrics_handler.last_values
-        cum_metrics: Dict[str, float] = {}
+        cum_metrics: dict[str, float] = {}
 
         with torch.no_grad():
             progress_bar = tqdm.tqdm(dataloader, file=sys.stdout)
@@ -452,16 +459,17 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
 
         return metrics
 
-    def _clean_checkpoints(self):
-        """Delete all the checkpoints except the last one and 'best.ckpt'"""
-        files = os.listdir(os.path.join(self.output_dir, "checkpoints"))
-        for checkpoint_file in filter(lambda file: file[-5:] == ".ckpt", files):
-            if checkpoint_file in {"best.ckpt", f"{self.epoch}.ckpt"}:
+    def _clean_checkpoints(self) -> None:
+        """Delete all the checkpoints except the last one and 'best.ckpt'."""
+        for checkpoint_file in (self.output_dir / "checkpoints").iterdir():
+            if checkpoint_file.name[-5:] != ".ckpt":
                 continue
-            os.remove(os.path.join(self.output_dir, "checkpoints", checkpoint_file))
+            if checkpoint_file.name in {"best.ckpt", f"{self.epoch}.ckpt"}:
+                continue
+            checkpoint_file.unlink()
 
-    def save(self, filename: str):
-        """Save a checkpoint with the following format
+    def save(self, filename: str) -> None:
+        """Save a checkpoint with the following format.
 
         {
             "model": model_state_dict,
@@ -490,10 +498,10 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
         if self.use_amp:
             state["scaler"] = self.scaler.state_dict()
 
-        torch.save(state, os.path.join(self.output_dir, "checkpoints", filename))
+        torch.save(state, self.output_dir / "checkpoints" / filename)
 
-    def load(self, path: str, strict: bool = False, restore_optim_hp: bool = True):
-        """Reset the trainer to a given checkpoint
+    def load(self, path: str, strict: bool = False, restore_optim_hp: bool = True) -> None:
+        """Reset the trainer to a given checkpoint.
 
         It will reload model weights, optimizer state and hyper parameters (with scheduler),
         scaler state. Note that the best validation metric is not stored in the checkpoint,
@@ -523,7 +531,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             else:
                 if strict:
                     raise ValueError("Missing scaler state dict")
-                print("Missing scaler state dict. Keeping the current state")
+                warnings.warn("Missing scaler state dict. Keeping the current state", stacklevel=2)
 
         if restore_optim_hp:
             self.optimizer.load_state_dict(state["optimizer"])
@@ -537,7 +545,7 @@ class PytorchTrainer:  # pylint: disable=too-many-instance-attributes
             else:
                 if strict:
                     raise ValueError("Missing scheduler state dict")
-                print("Missing scheduler state dict. Keeping the current state")
+                warnings.warn("Missing scheduler state dict. Keeping the current state", stacklevel=2)
 
         # Allowing time shifting if epoch/step is not here
         self.epoch = state.get("epoch", 0)

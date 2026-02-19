@@ -1,30 +1,18 @@
-"""An example of Deep Trainer with Cifar and torchvision"""
+"""An example of Deep Trainer with Cifar and torchvision."""
 
 import argparse
 
 import torch
 import torch.utils.data
-import torchvision  # type: ignore
+import torchvision  # type: ignore[import-untyped]
+from torch_resnet import PreActResNet18
 
 from deep_trainer import PytorchTrainer
 from deep_trainer.pytorch import metric
 
-from resnet import PreActResNet18
 
-
-class Model(torch.nn.Module):
-    """PreActResNet for 32x32 images"""
-
-    def __init__(self, num_classes) -> None:
-        super().__init__()
-        self.backbone = PreActResNet18()
-        self.fc = torch.nn.Linear(self.backbone.features_dimension, num_classes)
-
-    def forward(self, x):
-        return self.fc(self.backbone(x))
-
-
-def main(checkpoint, epochs, lr, batch_size, weight_decay, device, use_amp, override_optim_hp):
+def main(checkpoint, epochs, lr, batch_size, weight_decay, device, use_amp, override_optim_hp):  # noqa: PLR0913
+    """Train & evaluate a PreActResNet18 on Cifar10."""
     # Data
     transform_train = torchvision.transforms.Compose(
         [
@@ -49,7 +37,8 @@ def main(checkpoint, epochs, lr, batch_size, weight_decay, device, use_amp, over
     test_loader = torch.utils.data.DataLoader(testset, batch_size=batch_size * 4, shuffle=False, num_workers=8)
 
     # Model
-    model = Model(len(trainset.classes))
+    model = PreActResNet18(small_images=True)
+    model.set_head(torch.nn.Linear(model.out_planes, len(trainset.classes)))
     model.to(device)
 
     # optimizer and Scheduler
@@ -106,4 +95,6 @@ if __name__ == "__main__":
 
     print(args)
 
-    main(args.checkpoint, args.e, args.lr, args.bs, args.wd, args.device, args.amp, args.override_optim_hp)
+    main(
+        args.checkpoint, args.e, args.lr, args.bs, args.wd, torch.device(args.device), args.amp, args.override_optim_hp
+    )
