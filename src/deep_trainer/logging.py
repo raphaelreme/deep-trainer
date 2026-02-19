@@ -1,8 +1,14 @@
-"""Logger used in the Trainer.
+"""Training loggers.
 
-You can create your own logger class following these examples.
+This module defines a minimal scalar logging interface (`TrainLogger`) and a few concrete
+implementations used by `PytorchTrainer`:
 
-By default the TensorBoard logger is used.
+- `TensorBoardLogger`: writes scalars to TensorBoard.
+- `DictLogger`: stores scalars in-memory for plotting/testing.
+- `MultiLogger`: fans out logging calls to multiple loggers.
+
+The logging contract is intentionally small: `log(name, value, step)`.
+Names are typically hierarchical (e.g. "A_train_batch/Loss") so UIs can group them.
 """
 
 import sys
@@ -16,17 +22,31 @@ else:
 
 
 class TrainLogger:
-    """Base logger class. By default, do not log.
+    """Abstract interface for logging scalar training signals.
 
-    Each logger should define its own `log` method.
+    A logger receives scalar values identified by a string `name` at a given integer `step`.
+    Implementations may write to disk, stream to a service, or store in memory.
+
+    Implementers should treat `log()` as best-effort and avoid expensive blocking operations
+    when called every batch.
     """
 
     def log(self, name: str, value: float, step: int) -> None:
-        """Log a value for a given step of training."""
+        """Record a scalar value.
+
+        Args:
+            name (str): Metric name (often a hierarchical path like "A_train_batch/Loss").
+            value (float): Scalar value to record.
+            step (int): Global step index (monotonic increasing during training).
+        """
 
 
 class TensorBoardLogger(TrainLogger):
-    """Log training values to tensorboard."""
+    """TensorBoard-backed logger for scalar values.
+
+    Attributes:
+        output_dir: Directory passed to `SummaryWriter(log_dir=...)`.
+    """
 
     def __init__(self, output_dir: str):
         super().__init__()
@@ -38,9 +58,17 @@ class TensorBoardLogger(TrainLogger):
 
 
 class DictLogger(TrainLogger):
-    """Log training values in the given dict.
+    """In-memory logger storing all scalars in a Python dict.
 
-    A reference to the dict is kept in `logs` attribute. You can access the logs through it.
+    Data structure:
+        `logs[name] == (steps, values)` where:
+        - `steps` is `list[int]`
+        - `values` is `list[float]`
+
+    This is useful for unit tests, notebooks, or custom plotting without TensorBoard.
+
+    Args:
+        logs: Optional external dict to populate. If provided, it is mutated in-place.
     """
 
     def __init__(self, logs: dict[str, tuple[list[int], list[float]]] | None = None):
@@ -60,7 +88,13 @@ class DictLogger(TrainLogger):
 
 
 class MultiLogger(TrainLogger):
-    """Redirects logs to several loggers."""
+    """Fan-out logger that forwards each log call to multiple loggers.
+
+    Useful to combine, e.g., TensorBoard + in-memory logs.
+
+    Args:
+        loggers: List of logger instances to call sequentially.
+    """
 
     def __init__(self, loggers: list[TrainLogger]):
         super().__init__()

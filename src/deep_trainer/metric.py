@@ -1,6 +1,21 @@
-"""Metrics used for training and evaluation.
+"""Metric computation helpers for training and evaluation.
 
-Provide the API and some examples of useful metrics for classification.
+This module defines a small metric API designed for streaming updates over batches:
+
+- `Metric`: updated each batch and aggregated across a full epoch/evaluation run.
+- `Prerequisite`: shared computation that multiple metrics can depend on (e.g., confusion matrix).
+- `MetricsHandler`: orchestrates updates/aggregation for the active mode (train vs eval).
+
+Key ideas
+---------
+- Metrics can be enabled/disabled independently for training and evaluation.
+- Some metrics make sense per batch (e.g., loss) and can update `last_value`.
+- Others are only meaningful after aggregation (e.g., balanced accuracy) and may keep
+  `last_value = NaN` until `aggregate()`.
+
+Caveat
+------
+The handler does not currently detect circular prerequisite dependencies.
 """
 
 from __future__ import annotations
@@ -20,15 +35,21 @@ else:
 
 
 class Prerequisite:
-    """A common code to run before some metrics that can be shared between metrics.
+    """Shared computation required by one or more metrics.
 
-    The idea is that some metrics can define prerequisites (shared between metrics)
-    Each prerequisite can also have its own prerequisites. The metrics handler will first
-    update in order the prerequisites, then the metrics.
+    A prerequisite is updated once per batch (before dependent metrics) and may maintain
+    state needed to compute multiple metrics efficiently.
 
-    It's up to the metric/prerequisite to fetch the work of its own prerequisites.
+    Example:
+        A `ConfusionMatrix` prerequisite accumulates counts and enables computing
+        precision/recall/F1 without recomputing predictions.
 
-    An example is given with the ConfusionMatrix class.
+    Notes:
+        - Prerequisites can depend on other prerequisites (a dependency graph).
+        - The `MetricsHandler` performs a (simple) topological ordering before updating/aggregating.
+
+    Attributes:
+        prerequisites (set[Prerequisite]): Set of `Prerequisite` instances required.
     """
 
     def __init__(self) -> None:
@@ -38,7 +59,7 @@ class Prerequisite:
         """Update the prerequisite with the current batch.
 
         Args:
-            batch (Any): Batch used for outputs computation. Probably contains labels
+            batch (Any): Current batch (usually (inputs, labels)).
             outputs (Any): Output of the model
         """
         raise NotImplementedError
@@ -53,20 +74,20 @@ class Prerequisite:
 
 
 class Metric:
-    """Base class for metric to be tracked during training.
+    """Base class for tracked metrics during training.
 
-    A metric is updated at each batch, and can be aggregated whenever it is necessary.
-    A last value can be accessed. But for some metrics it will not make sense and NaN can be returned
+    Lifecycle:
+        - `reset()` clears state (called at the start of an epoch/evaluation run)
+        - `update(batch, outputs)` is called once per batch
+        - `aggregate()` produces a final scalar across all seen batches
 
     Attributes:
-        prerequisites (set[Prerequisite]): Prerequisites to update and aggregate before this metric
-            Prerequisites are updated by the MetricsHandler class. If you use prerequisites without a metrics handler
-            you should update them manually.
-        last_value (float): Value of the metric on the last update (can be NaN)
-        display_name (str): Name to be used in the loggers
-        train (bool): Compute this metric during train loop
-        evaluate (bool): Compute this metric during evaluate loop
-        minimize (bool): Should the metric be minimized or maximized
+        prerequisites (set[Prerequisite]): Set of `Prerequisite` instances required to compute this metric.
+        last_value (float): The most recent batch-level value, if meaningful. (NaN if not)
+        display_name (str): Name of the metric used for logging and dictionary keys.
+        train (bool): Whether the metric is active during training loops.
+        evaluate (bool): Whether the metric is active during evaluation loops.
+        minimize (bool): Whether "lower is better" when selecting the best checkpoint.
     """
 
     def __init__(self, display_name: str | None = None, train: bool = True, evaluate: bool = True, minimize=True):
@@ -83,7 +104,7 @@ class Metric:
         It will set the metric last_value for this particular batch if the metric can be computed per batch.
 
         Args:
-            batch (Any): Batch used for outputs computation. Probably contains labels
+            batch (Any): Current batch (usually (inputs, labels)).
             outputs (Any): Output of the model
         """
         raise NotImplementedError
@@ -102,7 +123,19 @@ class Metric:
 
 
 class MetricsHandler:
-    """Handle a given list of metrics."""
+    """Orchestrate metric/prerequisite updates and aggregation.
+
+    The handler maintains a mode (`training=True/False`) controlling which metrics are active.
+
+    Typical usage:
+        handler = MetricsHandler([Accuracy(train=True, evaluate=True), ...])
+        handler.set_validation_metric(index)
+
+    During training/evaluation loops, the trainer calls:
+        - `handler.reset()` once per epoch/run
+        - `handler.update(batch, outputs)` each batch
+        - `handler.aggregated_values` at the end to log epoch-level values
+    """
 
     def __init__(self, metrics: list[Metric]):
         self.training = True
@@ -169,7 +202,7 @@ class MetricsHandler:
         self.train(False)
 
     def get_validation_metric(self) -> Metric | None:
-        """Get the validation metric.
+        """Get the metric which is used as the model-selection criterion.
 
         Returns None if not set.
 
@@ -179,9 +212,12 @@ class MetricsHandler:
         return self._validation_metric
 
     def set_validation_metric(self, index: int) -> None:
-        """Select a validation metric.
+        """Choose which metric is used as the model-selection criterion.
 
-        Without validation metric, the train criterion is used by default to validate training.
+        The selected metric must have `evaluate=True`, because it is intended to be computed
+        on the validation set. The trainer uses:
+        - `metric.minimize` to decide whether lower or higher is better
+        - `metric.display_name` to extract the value from aggregated validation metrics
 
         Args:
             index (int): Index of the metric
@@ -193,16 +229,8 @@ class MetricsHandler:
     def update(self, batch, outputs) -> None:
         """Update all the metrics for the current mode.
 
-        For a more finegrained control, each metric can be updated on its own.
-
-        You can for instance go through the current metrics with:
-        ```
-        for metric in metric_handler:
-            metric.update(...)
-        ```
-
         Args:
-            batch (Any): Batch used for outputs computation. Probably contains labels
+            batch (Any): Current batch (usually (inputs, labels)).
             outputs (Any): Output of the model
         """
         for prerequisite in self.build_prerequisites(self.current_metrics()):
@@ -249,7 +277,15 @@ class MetricsHandler:
 
 # Some metrics examples
 class PytorchMetric(Metric):
-    """Average a pytorch loss function."""
+    """Average a PyTorch loss-style callable over samples.
+
+    This metric treats the provided callable as returning a per-batch scalar, and averages it
+    by weighting each batch by its `batch_size`.
+
+    Attributes:
+        loss_function (Callable[[torch.Tensor, torch.Tensor], torch.Tensor]): PyTorch loss-style function.
+            Called expecting the following api: loss(predictions, targets) => scalar.
+    """
 
     def __init__(
         self,
@@ -289,9 +325,11 @@ class PytorchMetric(Metric):
 
 
 class Accuracy(PytorchMetric):
-    """Accuracy metric.
+    """Accuracy for multiclass classification.
 
-    Compute the proportion of corrected predicted targets. (Multiclass classification)
+    Notes:
+        - Targets are expected to be integer class ids of shape `(N,)`.
+        - Predictions are expected to be class scores/logits of shape `(N, C)`.
     """
 
     def __init__(self, train: bool = True, evaluate: bool = True):
@@ -304,13 +342,15 @@ class Accuracy(PytorchMetric):
 
 
 class Error(PytorchMetric):
-    """Error metric.
+    """Error (1 - Accuracy) for multiclass classification.
 
-    Compute the proportion of corrected predicted targets. (Multiclass classification)
+    Notes:
+        - Targets are expected to be integer class ids of shape `(N,)`.
+        - Predictions are expected to be class scores/logits of shape `(N, C)`.
     """
 
     def __init__(self, train: bool = True, evaluate: bool = True):
-        super().__init__(self._compute, "Error", train, evaluate, False)
+        super().__init__(self._compute, "Error", train, evaluate, True)
 
     @staticmethod
     def _compute(predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -319,9 +359,13 @@ class Error(PytorchMetric):
 
 
 class TopK(PytorchMetric):
-    """TopK metric.
+    """Top@K metric for multiclass classification.
 
-    A prediction is valid if the true target is in the top k. (Multiclass classification)
+    A prediction is valid if the true target is in the top k predictions.
+
+    Notes:
+        - Targets are expected to be integer class ids of shape `(N,)`.
+        - Predictions are expected to be class scores/logits of shape `(N, C)`.
     """
 
     def __init__(self, k: int, train: bool = True, evaluate: bool = True):
@@ -334,12 +378,16 @@ class TopK(PytorchMetric):
 
 
 class BalancedAccuracy(Metric):
-    """Balanced Accuracy Metric.
+    """Balanced accuracy (macro recall) for multiclass classification.
 
-    Compute the Balanced Accuracy of the predictions. <=> Average the recall of each target.
-    This criterion has meaning only at aggregation time.
+    This metric accumulates per-class true positives and occurrences, and computes:
 
-    Equivalent to Recall-macro
+        mean_c ( TP_c / N_c )
+
+    Notes:
+        - The metric is only meaningful at aggregation time; `last_value` is 'NaN'.
+        - Targets are expected to be integer class ids of shape `(N,)`.
+        - Predictions are expected to be class scores/logits of shape `(N, C)`.
     """
 
     def __init__(self, train: bool = True, evaluate: bool = True):
@@ -377,7 +425,24 @@ class BalancedAccuracy(Metric):
 
 # Examples of metrics with prerequisite
 class ConfusionMatrix(Prerequisite):
-    """Compute a confusion matrix as a prerequisite (Multiclass classification)."""
+    """Multiclass confusion matrix accumulator.
+
+    This prerequisite accumulates a `(k, k)` matrix `C` where:
+
+        C[true_class, predicted_class] += 1
+
+    It is intended to be shared across multiple metrics (precision/recall/F1),
+    so predictions are only converted to class ids once per batch.
+
+    Assumptions:
+        - `outputs` is a tensor of class scores/logits with shape `(N, k)` (or at least argmax-able on dim=1)
+        - batch = (_, targets), where targets is a tensor of integer class ids with shape `(N,)`
+        - class ids are expected to be in `[0, k-1]`
+
+    Attributes:
+        k (int): Number of classes.
+        confusion_matrix (torch.Tensor): A float tensor of shape `(k, k)` with accumulated counts.
+    """
 
     def __init__(self, k: int) -> None:
         super().__init__()
@@ -409,26 +474,28 @@ class ConfusionMatrix(Prerequisite):
 
 
 class Recall(Metric):
-    """Compute Recall from ConfusionMatrix prerequisite (Multiclass classification).
+    """Recall computed from a `ConfusionMatrix` prerequisite (multiclass classification).
 
-    Equivalent to BalancedAccuracy in the 'macro' setting.
+    For each class `c`:
+        recall_c = TP_c / N_c
+
+    Aggregation modes:
+        - "macro": unweighted mean of per-class recall.
+        - "weighted": average weighted by the number of true samples per class
+          (equivalent to sum(TP_c) / sum(N_c) over valid classes)
+
+    Notes:
+        - This metric is meaningful at aggregation time; per-batch `last_value` is typically NaN.
+        - Classes with zero true occurrences are ignored.
+
+    Args:
+        confusion_prerequisite: Confusion matrix accumulator to depend on.
+        average (str): Aggregation mode: "macro" or "weighted".
     """
 
     def __init__(
         self, confusion_prerequisite: ConfusionMatrix, average="macro", train: bool = True, evaluate: bool = True
     ):
-        """Constructor.
-
-        Args:
-            confusion_prerequisite (ConfusionMatrix): Prerequisite needed to compute this metric
-            average ("macro" | "weighted"): Aggregation method of the score (Similar to sklearn)
-                'macro': Calculate metrics for each label, and find their unweighted mean.
-                    This does not take label imbalance into account.
-                'weighted': Calculate metrics for each label, and find their weighted mean.
-                Default: 'macro'
-            train (bool): Use it for training
-            evaluate (bool): Use it for evaluation
-        """
         super().__init__(f"Recall-{average}", train, evaluate, False)
         self.prerequisites.add(confusion_prerequisite)
         self.confusion_matrix = confusion_prerequisite
@@ -464,23 +531,29 @@ class Recall(Metric):
 
 
 class Precision(Metric):
-    """Compute Precision from ConfusionMatrix prerequisite (Multiclass classification)."""
+    """Precision computed from a `ConfusionMatrix` prerequisite (multiclass classification).
+
+    For each class `c`:
+        precision_c = TP_c / (TP_c + FP_c)
+
+    Aggregation modes:
+        - "macro": unweighted mean of per-class precision.
+        - "weighted": average weighted by the number of true samples per class.
+
+    Handling of no-prediction classes:
+        If a class has zero predicted occurrences, its precision is defined as 0.
+
+    Note:
+        This metric is meaningful at aggregation time; per-batch `last_value` is typically NaN.
+
+    Args:
+        confusion_prerequisite: Confusion matrix accumulator to depend on.
+        average (str): Aggregation mode: "macro" or "weighted".
+    """
 
     def __init__(
         self, confusion_prerequisite: ConfusionMatrix, average="macro", train: bool = True, evaluate: bool = True
     ):
-        """Constructor.
-
-        Args:
-            confusion_prerequisite (ConfusionMatrix): Prerequisite needed to compute this metric
-            average ("macro" | "weighted"): Aggregation method of the score (Similar to sklearn)
-                'macro': Calculate metrics for each label, and find their unweighted mean.
-                    This does not take label imbalance into account.
-                'weighted': Calculate metrics for each label, and find their weighted mean.
-                Default: 'macro'
-            train (bool): Use it for training
-            evaluate (bool): Use it for evaluation
-        """
         super().__init__(f"Precision-{average}", train, evaluate, False)
         self.prerequisites.add(confusion_prerequisite)
         self.confusion_matrix = confusion_prerequisite
@@ -518,7 +591,27 @@ class Precision(Metric):
 
 
 class F1(Metric):
-    """Compute F1 score from ConfusionMatrix prerequisite (Multiclass classification)."""
+    """F1 score computed from a `ConfusionMatrix` prerequisite (multiclass classification).
+
+    For each class `c`:
+        precision_c = TP_c / (TP_c + FP_c)
+        recall_c    = TP_c / (TP_c + FN_c)
+        f1_c        = 2 * precision_c * recall_c / (precision_c + recall_c)
+
+    Aggregation modes:
+        - "macro": unweighted mean of per-class F1.
+        - "weighted": average weighted by the number of true samples per class.
+
+    Important constraint:
+        Classes with zero true occurrences are ignored. However, if such a class is
+        *predicted* (i.e. has non-zero predicted occurrences), this implementation raises,
+        because silently ignoring would hide systematic label-space mismatches.
+        If a class has zero predicted occurrences, its precision is defined as 0.
+
+    Args:
+        confusion_prerequisite: Confusion matrix accumulator to depend on.
+        average (str): Aggregation mode: "macro" or "weighted".
+    """
 
     def __init__(
         self, confusion_prerequisite: ConfusionMatrix, average="macro", train: bool = True, evaluate: bool = True
@@ -558,10 +651,7 @@ class F1(Metric):
         # Only keep targets with at least a true sample
         valid_targets = target_occurrences != 0
         if prediction_occurrences[~valid_targets].sum() != 0:
-            raise ValueError(
-                "Cannot compute recall for targets without any sample."
-                "And unable to ignore some of these targets as they are predicted"
-            )
+            raise ValueError("Cannot compute recall of predicted targets without any true sample.")
         target_occurrences = target_occurrences[valid_targets]
         prediction_occurrences = prediction_occurrences[valid_targets]
         true_positives = true_positives[valid_targets]

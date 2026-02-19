@@ -1,4 +1,21 @@
-"""Provide the Trainer Class for PyTorch."""
+"""PyTorch Trainer.
+
+This module provides:
+
+- Small helpers (`round_to_n`, `build_description`, `cyclic_iterator`) used for progress display.
+- `PytorchTrainer`, a lightweight training loop wrapper around a `torch.nn.Module` plus:
+  optimizer, (optional) scheduler, mixed precision (optional), metrics, logging, and checkpointing.
+
+Design goals
+------------
+- Keep the trainer easy to subclass: override `process_*_batch`, `train_step`, `eval_step`, or `backward`.
+- Work with any `torch.utils.data.DataLoader` that yields `(inputs, targets)` by default.
+- Provide simple checkpoint formats (`save` / `load`) suitable for experiment iteration.
+
+Limitations
+-----------
+- Distributed training / multi-device (DDP/FSDP/TPU) is not handled here.
+"""
 
 from __future__ import annotations
 
@@ -24,14 +41,21 @@ if TYPE_CHECKING:
 
 
 def round_to_n(x: float, n_digits: int) -> float:
-    """Round a floating point to n significant digits.
+    """Round a floating-point number to a given number of significant digits.
+
+    This rounds based on *significant figures* (not decimal places). For example:
+    - `round_to_n(1234.5, 2) -> 1200.0`
+    - `round_to_n(0.012345, 2) -> 0.012`
+
+    Special cases:
+    - If `x` is `0.0`, `inf`, `-inf`, or `nan`, it is returned unchanged.
 
     Args:
-        x (float): Number to round
-        n_digits (int): Number of digits to keep
+        x (float): Value to round.
+        n_digits (int): Number of significant digits to keep. Must be >= 1.
 
     Returns:
-        float: Rounded version of x with n_digits digits
+        float: The rounded value.
     """
     if not math.isfinite(x) or x == 0:
         return x
@@ -40,14 +64,20 @@ def round_to_n(x: float, n_digits: int) -> float:
 
 
 def build_description(name: str, metrics: dict[str, float]) -> str:
-    """Create a description string from a name and some metrics.
+    """Build a readable progress-bar description from metric values.
+
+    The output is intended for tqdm `set_description`, e.g.:
+
+        "Training --- Accuracy:  0.9231, Loss:  0.1234"
+
+    Metrics are sorted by name for stable display, and values are rounded to 4 significant digits.
 
     Args:
-        name (str): Main name of the description
-        metrics (Dict[str, float]): Metrics to print
+        name (str): Prefix displayed first (e.g. "Training", "Testing").
+        metrics (dict[str, float]): Mapping from metric display name to numeric value.
 
     Returns:
-        str: "{name} --- {metric_name}: {metric_value}, ..., {metric_name}: {metric_value}"
+        str: A single-line description string.
     """
     desc = name
 
@@ -62,13 +92,22 @@ def build_description(name: str, metrics: dict[str, float]) -> str:
 
 
 def cyclic_iterator(iterable: Iterable) -> Generator:
-    """Build a infinite cyclic iterator over an iterable.
+    """Yield items from `iterable` forever, restarting on exhaustion.
 
-    Different from `itertools.cycle`: It does not try to keep the first iteration in memory
-    (heavy and we want to keep randomness in dataloaders)
+    This is similar to `itertools.cycle`, except it does *not* cache the first pass in memory.
+    That matters for:
+    - large datasets
+    - data loaders with randomness (reshuffling per epoch)
+    - iterables that should be re-instantiated each cycle
+
+    Note:
+        The iterable must be restartable via `iter(iterable)`. For `DataLoader`, this is true.
 
     Args:
-        iterable (Iterable): Iterable to wrap
+        iterable: Any restartable iterable.
+
+    Yields:
+        Items from `iterable` in an infinite loop.
     """
     iterator = iter(iterable)
     while True:
@@ -79,9 +118,48 @@ def cyclic_iterator(iterable: Iterable) -> Generator:
 
 
 class PytorchTrainer:
-    """Base trainer for pytorch project.
+    """A small, subclass-friendly trainer for PyTorch.
 
-    Wraps all the training procedures for a given model, optimizer and scheduler.
+    `PytorchTrainer` orchestrates a standard training loop:
+
+    - move model to a target device
+    - iterate batches
+    - forward pass + loss computation
+    - (optional) automatic mixed precision via `torch.autocast` + `torch.GradScaler`
+    - backward / optimizer step / (optional) scheduler step
+    - update and aggregate metrics through `metric.MetricsHandler`
+    - log scalars through a `logging.TrainLogger`
+    - save / load checkpoints
+
+    Typical usage
+    -------------
+    >>> train_loader, val_loader, test_loader = ...  # Define the dataset loading and splitting
+    >>> model, optimizer, scheduler = ...  # Define the model and optimizer
+    >>> metrics = metric.MetricsHandler([metric.Accuracy(evaluate=True)])  # Add some metrics
+    >>> trainer = PytorchTrainer(model, optimizer, scheduler, metrics, save_mode="small")
+    >>> trainer.train(epochs=10, train_loader, criterion=torch.nn.CrossEntropyLoss(), val_loader=val_loader)
+    >>> scores = trainer.evaluate(test_loader)
+
+    Customization points
+    --------------------
+    Override one of the following for custom behavior:
+
+    - `process_train_batch` / `process_eval_batch`:
+        adapt dataloader batch structure (e.g. dict batches, multiple inputs).
+    - `train_step` / `eval_step`:
+        implement non-standard forward passes, multi-loss, teacher forcing, etc.
+    - `backward`:
+        implement gradient accumulation, custom clipping, manual AMP, etc.
+
+    Checkpointing
+    -------------
+    `save()` writes a dict to `{output_dir}/checkpoints/{filename}` containing model/optimizer state,
+    and optionally scheduler + scaler state.
+
+    `save_mode`:
+        - "never": do not write checkpoints
+        - "small": keep `{epoch}.ckpt` for latest epoch and `best.ckpt`
+        - "all": keep all epoch checkpoints + `best.ckpt`
     """
 
     train_bar_name = "Training"
@@ -101,37 +179,36 @@ class PytorchTrainer:
         save_mode: str = "never",
         use_amp: bool = False,
     ):
-        """Constructor.
+        """Create a Trainer for the training loop orchestration.
 
-        The model is sent to the device even though this should probably be done before
-
-        By default there is a logger that will save all training metrics to tensorboard.
-        You can overwrite this by assigning a new logger to `trainer.logger`. (For instance a DictLogger
-        that will keep the metrics in Ram so that you can draw your own curves.)
+        Notes:
+            - If `device` is None, the trainer selects CUDA if available, otherwise CPU.
+            - The model is sent to the device (multi-device training is not supported yet)
+            - The scheduler (when provided) is assumed to be stepped **per training step**
+            (see `backward`), not per epoch.
+            - Checkpoints are written under `{output_dir}/checkpoints/`.
 
         Args:
-            model (torch.nn.Module): The model to be trained
-            optimizer (torch.optim.Optimizer): Optimizer to use
-            scheduler (torch.optim.lr_scheduler._LRScheduler): Optional learning rate scheduler.
-                The `step` method is called at each training step. (More reliable than calling it at each epoch,
-                though it can lead to compute epoch-equivalent steps).
-                Default: None
-            metrics_handler (metric.MetricdHandler): Handle a list of metrics to track.
-                See the documentation of `Metric` for more info.
-                In order to train, an additional criterion should be given to compute a differentiable loss.
-                In order to select the best model on a validation metric, you should select the validation metric
-                of the metrics_handler. Otherwise the train criterion will be used.
-            device (torch.device): Torch device to use. If None, the default device will be cuda:0
-                (or cpu if cuda is not available)
-                TPU or Multi device training is not supported yet.
-            logger (TrainLogger): Logger object. If not provided a default tensorboard logger will be created.
-            output_dir (str | os.PathLike): output directory, where checkpoints, logs, [...] are saved
-            save_mode ("never"|"small"|"all"): Checkpointing mode (see `save` and `load`)
-                never: No checkpoint for this training
-                small: Keep only the best checkpoint 'best.ckpt' and the last checkpoint
-                       '{epoch}.ckpt' (automatically clean the previous ones)
-                all  : Keep everything. '{epoch}.ckpt' for each epoch and 'best.ckpt'
-            use_amp (bool): Whether to use Automatique Mixed Precision. (with `torch.cuda.amp`)
+            model (torch.nn.Module): The model to train.
+            optimizer (torch.optim.Optimizer): Optimizer used to update model parameters.
+            scheduler (torch.optim.lr_scheduler.LRScheduler | None): Optional learning rate scheduler.
+                If provided, `scheduler.step()` is called after successful optimizer updates
+                (i.e. when AMP does not skip the step). Note that it is called every training step by default
+                and not every epoch.
+            metrics_handler (metric.MetricsHandler): Handles metrics update/aggregation in train/eval loops.
+                If None, an empty `MetricsHandler([])` is used.
+                For training, an additional criterion should be given to compute a differentiable loss.
+                To select the best validated model, the validation metric of the handler is used. If it is
+                undefined the train criterion will be used instead.
+            device (torch.device): Device on which to run the model and move batches. Defaults to CUDA if available.
+                Only cpu and cuda devices are supported.
+            logger (TrainLogger): Logger used to record scalar metrics. By default, a TensorBoard logger is created.
+            output_dir (str | os.PathLike): Experiment directory where logs and checkpoints are stored.
+            save_mode (str): Checkpoint retention policy:
+                - "never": never write checkpoints
+                - "small": keep `best.ckpt` and the last epoch checkpoint `{epoch}.ckpt`
+                - "all": keep all epoch checkpoints `{epoch}.ckpt` plus `best.ckpt`
+            use_amp (bool): Whether to enable Automatic Mixed Precision (AMP) with `torch.amp`
         """
         self.model = model
         self.optimizer = optimizer
@@ -174,51 +251,59 @@ class PytorchTrainer:
         return inputs, targets
 
     def process_train_batch(self, batch) -> tuple:
-        """Process each training batch.
+        """Prepare a batch for the training step.
 
-        Extract inputs for the model, targets for the loss, and batch size.
+        The default implementation expects `batch == (inputs, targets)` and moves both
+        tensors to `self.device`.
 
-        Should be overwritten for special train batches.
+        Override if your DataLoader yields:
+        - dictionaries (e.g. HuggingFace-style)
+        - multiple input tensors
+        - additional metadata
 
         Args:
-            batch (Any): The batch from the train_loader.
+            batch (Any): A single batch produced by `train_loader`.
 
         Returns:
-            inputs (Any): A valid input for the model
-            targets (Any): A valid target for the loss
+            tuple: A `(inputs, targets)` pair consumable by `self.model(inputs)` and `criterion(preds, targets)`.
         """
         return self._default_process_batch(batch)
 
     def process_eval_batch(self, batch) -> tuple:
-        """Process each eval batch.
+        """Prepare a batch for the training step.
 
-        Extract inputs for the model, targets for the loss, and batch size.
+        The default implementation expects `batch == (inputs, targets)` and moves both
+        tensors to `self.device`.
 
-        Should be overwritten for special eval batches.
+        Override if your DataLoader yields:
+        - dictionaries (e.g. HuggingFace-style)
+        - multiple input tensors
+        - additional metadata
 
         Args:
-            batch (Any): The batch from the eval_loader.
+            batch (Any): A single batch produced by `val_loader`.
 
         Returns:
-            inputs (Any): A valid input for the model
-            targets (Any): A valid target for the loss
+            tuple: A `(inputs, targets)` pair consumable by `self.model(inputs)` and `criterion(preds, targets)`.
         """
         return self._default_process_batch(batch)
 
     def backward(self, loss: torch.Tensor) -> None:
-        """Do the backpropagation step.
+        """Run backward + optimizer step (+ optional scheduler step).
 
-        Called at each training steps with the computed loss, it handles:
-          * The backward of the loss (to be scaled or not if use_amp)
-          * The scheduler, optimizer and scaler step / update
+        Default behavior:
+        - `optimizer.zero_grad()`
+        - scaled backward if AMP is enabled (`GradScaler.scale(loss).backward()`)
+        - `scaler.step(optimizer)` + `scaler.update()`
+        - if the step was *not skipped* due to inf/nan gradients, call `scheduler.step()` (if provided)
 
-        Should be overwritten for special behavior. Use the default implementation as an example.
-        (For instance you could do gradient accumulation here)
-
-        For more complex behavior you can avoid calling backward in the trainstep and handle everything yourself.
+        Notes:
+            - This trainer assumes a *per-step* scheduler (stepped every batch).
+              If you want epoch-based scheduling, override this method.
+            - For gradient accumulation, clipping, or multiple optimizers, override this method.
 
         Args:
-            loss (torch.Tensor): Loss for the current batch.
+            loss: Scalar loss tensor for the current batch.
         """
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
@@ -235,24 +320,32 @@ class PytorchTrainer:
             self.scheduler.step()
 
     def train_step(self, batch, criterion: Callable[..., torch.Tensor]) -> dict[str, float]:
-        """Perform a training step.
+        """Run one optimization step on a single batch.
 
-        Should be overwritten for special behaviors. The steps are:
-            - Processing the batch from the train dataloader (By default: `PytorchTrainer.process_train_batch`)
-            - Compute model outputs (By default: `self.model(inputs)`)
-            - Compute loss using the criterion
-            - Backward as needed (By default: `PytorchTrainer.backward` which will handle optimizer and scheduler steps)
-            - Update metrics (if needed) and return a dictionary of metrics with a "Loss" entry
+        Default implementation performs:
+            1) `inputs, targets = process_train_batch(batch)`
+            2) forward pass: `predictions = model(inputs)` (under autocast if AMP enabled)
+            3) compute loss: `loss = criterion(predictions, targets)`
+            4) update metrics: `metrics_handler.update((inputs, targets), predictions.detach())`
+            5) backward/step via `self.backward(loss)` (optimizer + scaler + optional scheduler)
+            6) return a dict containing:
+                - all metric last values (`metrics_handler.last_values`)
+                - plus `"Loss": loss.item()`
+
+        Override this method for customization:
+            - specific batch processing
+            - multiple losses / auxiliary heads
+            - models needing extra inputs (attention masks, metadata, etc.)
+            - custom metric update logic
+            - manual optimization (multiple optimizers, accumulation)
 
         Args:
-            batch (Any): The batch from the train loader
-            criterion (Callable[[Any, Any], torch.Tensor]): Loss function given to the train method.
-                See `PytorchTrainer.train` documentation.
+            batch (Any): A batch from the training DataLoader.
+            criterion (Callable[..., torch.Tensor]): Differentiable loss function.
 
         Returns:
-            dict[str, float]: Evaluation of metrics on this batch
-                Should contain a "Loss" entry.
-                All the items (one by metric by default), will be logged
+            dict[str, float]: Batch-level metric values. Is expected to contain a `"Loss"` key.
+                The returned values will be logged.
         """
         inputs, targets = self.process_train_batch(batch)
 
@@ -269,14 +362,21 @@ class PytorchTrainer:
         return metrics
 
     def eval_step(self, batch) -> dict[str, float]:
-        """Perform an evaluation step with the metrics.
+        """Compute metrics on a single evaluation batch.
+
+        Default implementation performs:
+            1) `inputs, targets = process_eval_batch(batch)`
+            2) forward pass: `predictions = model(inputs)` (under autocast if AMP enabled)
+            3) update metrics: `metrics_handler.update((inputs, targets), predictions)`
+
+        Note:
+            The outer evaluation loop (`evaluate`) runs this under `torch.no_grad()`.
 
         Args:
-            batch (Any): Batch from the dataloader given to evaluate
+            batch (Any): A batch from the evaluation DataLoader.
 
         Returns:
-            dict[str, float]: Evaluation of the metrics on this batch
-                Should contain a "Loss" entry
+            dict[str, float]: Batch-level metric values (`metrics_handler.last_values`).
         """
         inputs, targets = self.process_eval_batch(batch)
 
@@ -357,24 +457,23 @@ class PytorchTrainer:
         val_loader: torch.utils.data.DataLoader | None = None,
         epoch_size: int = 0,
     ) -> PytorchTrainer:
-        """Train the model.
+        """Train the model for a number of epochs.
 
-        Note:
-            If no validation metric is set in the metrics handler, then the criterion will be used
+        Validation & "best checkpoint" logic:
+        - If `val_loader` is provided and a validation metric is configured in `metrics_handler`,
+          that metric is used to decide whether to save `best.ckpt`.
+        - If no validation metric is configured, the trainer temporarily injects a `PytorchMetric`
+          based on `criterion` under the name "Loss" and uses it as the validation metric.
 
         Args:
-            epochs (int): Number of epochs to perform (Should be greater than 0)
-            train_loader (torch.utils.data.Dataloader): Data loader for the training set
-            criterion (Callable): Loss function which will be called with the model outputs and the
-                targets for each batch. Should return a singled loss value on which to backpropagate.
-                It should be differentiable.
-            val_loader (torch.utils.data.Dataloader): Optional validation data loader. If provided the
-                model will be evaluate after each epoch with it. If not, no validation is done.
-            epoch_size (int): The number of training steps for each epochs.
-                By default the length of the train_loader is used.
+            epochs (int): Number of epochs to run. Must be > 0.
+            train_loader (torch.utils.data.DataLoader): DataLoader for training batches.
+            criterion (Callable): Callable used to compute a differentiable scalar loss from `(predictions, targets)`.
+            val_loader (torch.utils.data.DataLoader | None): Optional DataLoader for validation (done every epoch).
+            epoch_size (int): Number of training steps per epoch. If 0, defaults to `len(train_loader)`.
 
         Returns:
-            Trainer: self
+            Trainer: `self` (to allow chaining).
         """
         n_epochs = self.epoch + epochs
 
@@ -424,10 +523,15 @@ class PytorchTrainer:
         return self
 
     def evaluate(self, dataloader: torch.utils.data.DataLoader) -> dict[str, float]:
-        """Evaluate the current model with the metrics on the dataloader.
+        """Evaluate the model on a dataset and return aggregated metrics.
+
+        Extra metrics:
+            The trainer also averages any values returned by `eval_step` that are *not*
+            part of `metrics_handler.aggregated_values` (useful if a subclass adds custom
+            per-batch metrics directly in `eval_step`).
 
         Args:
-            dataloader (torch.utils.data.Dataloader): Dataloader over the dataset to evaluate
+            dataloader (torch.utils.data.Dataloader): DataLoader yielding evaluation batches.
 
         Returns:
             Dict[str, float]: Aggregated metrics
@@ -469,22 +573,29 @@ class PytorchTrainer:
             checkpoint_file.unlink()
 
     def save(self, filename: str) -> None:
-        """Save a checkpoint with the following format.
+        """Save a checkpoint to disk.
 
-        {
-            "model": model_state_dict,
-            "optimizer": optimizer_state_dict,
-            "scheduler": scheduler_state_dict, (If any scheduler)
-            "scaler": scaler_state_dict, (If use_amp)
-            "epoch": epoch,
-            "step": step,
-            "val_metric": validation_metric, (self.val)
-        }
+        The checkpoint is saved as a `torch.save`-able dictionary at:
 
-        Saved at {output_dir}/checkpoints/filename
+            `{output_dir}/checkpoints/{filename}`
+
+        Format:
+            {
+                "model": model_state_dict,
+                "optimizer": optimizer_state_dict,
+                "scheduler": scheduler_state_dict,   # only if `self.scheduler` is not None
+                "scaler": scaler_state_dict,         # only if AMP enabled (`self.use_amp`)
+                "epoch": int,                        # current epoch counter
+                "step": int,                         # global training step counter
+                "val_metric": float,                 # last tracked validation metric value (`self.val`)
+            }
+
+        Note:
+            This stores the *current* validation metric value, not necessarily the best one.
+            (`best_val` / `best_epoch` are not included.)
 
         Args:
-            filename (str): Name of the checkpoint file
+            filename (str): Checkpoint file name (e.g. `"best.ckpt"`, `"10.ckpt"`).
         """
         state = {
             "model": self.model.state_dict(),
@@ -500,39 +611,44 @@ class PytorchTrainer:
 
         torch.save(state, self.output_dir / "checkpoints" / filename)
 
-    def load(self, path: str, strict: bool = False, restore_optim_hp: bool = True) -> None:
-        """Reset the trainer to a given checkpoint.
+    def load(self, path: str | os.PathLike, strict: bool = False, restore_optim_hp: bool = True) -> None:
+        """Restore trainer state from a checkpoint.
 
-        It will reload model weights, optimizer state and hyper parameters (with scheduler),
-        scaler state. Note that the best validation metric is not stored in the checkpoint,
-        therefore it use the current validation metric as the best one.
+        Loads (when present) the following from `path`:
+        - model weights
+        - optimizer state (and optionally its hyperparameters)
+        - scheduler state (if `self.scheduler` exists and `restore_optim_hp=True`)
+        - AMP scaler state (only if AMP is already enabled)
+        - epoch counter, global step counter, and last validation metric value
+
+        After loading `self.best_epoch` and `self.best_val` are set to the loaded `epoch` / `val_metric`
+        (i.e. the checkpoint becomes the new "best so far" baseline)
 
         Args:
-            path (str): Path to a valid checkpoint
-            strict (bool): Allowing partial loading
-                If True, will raise exception when missing keys are found
-            restore_optim_hp (bool): Whether to restore optimizer and scheduler hyper parameters.
-                Usual hyper parameters are learning rate (with its schedule), weight decay, momentum, etc
-                By default restores everything to restart the training as originally planned.
-                If False, it only restores the state of the optimizer and keep the current set of
-                hyper parameters (For the scheduler, there is nothing to load and you can even use
-                another scheduler).
-
-                Warning: With weight decay, it's common to build two param groups (one with wd and one without).
-                    When reloading with no weight decay, you should still split the params in these two groups, even
-                    if each group has the same hyper parameters.
+            path (str | os.PathLike): Path to a checkpoint produced by `save()`.
+            strict (bool): Controls missing component behavior.
+                For model weights: passed to `model.load_state_dict(..., strict=strict)`.
+                For scaler/scheduler: if missing and `strict=True`, raise `ValueError`,
+                otherwise emit a warning and keep the current state.
+            restore_optim_hp: Whether to restore optimizer (and scheduler) hyperparameters
+                (learning rate, weight decay, momentum, etc.).
+                By default (True), it restores everything to restart the training as originally planned.
+                If False, it only restores the optimizer states (e.g. momentum buffers) and keep the current
+                set of hyper parameters. In particular, the scheduler is not restored, and another can be
+                used instead.
         """
-        state = torch.load(path, map_location=self.device)
+        state: dict = torch.load(path, map_location=self.device)
         self.model.load_state_dict(state["model"], strict)
 
         if self.use_amp:
-            if state.get("scaler"):
+            if "scaler" in state:
                 self.scaler.load_state_dict(state["scaler"])
             else:
                 if strict:
                     raise ValueError("Missing scaler state dict")
                 warnings.warn("Missing scaler state dict. Keeping the current state", stacklevel=2)
 
+        # XXX: Investigate loading first scheduler, then optimizer as stated in the new documentation.
         if restore_optim_hp:
             self.optimizer.load_state_dict(state["optimizer"])
         else:
