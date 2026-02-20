@@ -119,3 +119,9 @@ strict = true
 
 [tool.coverage.run]
 source = ["deep_trainer"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if sys.version",
+    "raise NotImplementedError",
+]

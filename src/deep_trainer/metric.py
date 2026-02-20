@@ -270,10 +270,6 @@ class MetricsHandler:
         for metric in self.metrics:
             metric.reset()
 
-    def __iter__(self):
-        """Iterate on the active metrics."""
-        return self.current_metrics()
-
 
 # Some metrics examples
 class PytorchMetric(Metric):

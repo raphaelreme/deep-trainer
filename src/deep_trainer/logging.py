@@ -45,7 +45,7 @@ class TensorBoardLogger(TrainLogger):
     """TensorBoard-backed logger for scalar values.
 
     Attributes:
-        output_dir: Directory passed to `SummaryWriter(log_dir=...)`.
+        output_dir (str): Directory passed to `SummaryWriter(log_dir=...)`.
     """
 
     def __init__(self, output_dir: str):
@@ -67,16 +67,13 @@ class DictLogger(TrainLogger):
 
     This is useful for unit tests, notebooks, or custom plotting without TensorBoard.
 
-    Args:
-        logs: Optional external dict to populate. If provided, it is mutated in-place.
+    Attributes:
+        logs (dict[str, tuple[list[int], list[float]]]): Logs for all metrics.
     """
 
-    def __init__(self, logs: dict[str, tuple[list[int], list[float]]] | None = None):
+    def __init__(self):
         super().__init__()
-        if logs is None:
-            self.logs = {}
-        else:
-            self.logs = logs
+        self.logs: dict[str, tuple[list[int], list[float]]] = {}
 
     @override
     def log(self, name: str, value: float, step: int) -> None:
@@ -93,7 +90,7 @@ class MultiLogger(TrainLogger):
     Useful to combine, e.g., TensorBoard + in-memory logs.
 
     Args:
-        loggers: List of logger instances to call sequentially.
+        loggers (list[TrainLogger]): List of logger instances to call sequentially.
     """
 
     def __init__(self, loggers: list[TrainLogger]):

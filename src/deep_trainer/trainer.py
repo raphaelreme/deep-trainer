@@ -23,13 +23,14 @@ import math
 import pathlib
 import sys
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.utils.data
 import tqdm.auto as tqdm
 
-from . import logging, metric
+from . import logging as dt_logging
+from . import metric
 
 if TYPE_CHECKING:
     import os
@@ -174,7 +175,7 @@ class PytorchTrainer:
         scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
         metrics_handler: metric.MetricsHandler | None = None,
         device: torch.device | None = None,
-        logger: logging.TrainLogger | None = None,
+        logger: dt_logging.TrainLogger | None = None,
         output_dir: str | os.PathLike = "./experiments",
         save_mode: str = "never",
         use_amp: bool = False,
@@ -227,11 +228,11 @@ class PytorchTrainer:
         (self.output_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         (self.output_dir / "logs").mkdir(parents=True, exist_ok=True)
 
-        self.logger: logging.TrainLogger
+        self.logger: dt_logging.TrainLogger
         if logger is not None:
             self.logger = logger
         else:
-            self.logger = logging.TensorBoardLogger(str(self.output_dir / "logs"))  # TODO: Support for Path?
+            self.logger = dt_logging.TensorBoardLogger(str(self.output_dir / "logs"))  # TODO: Support for Path?
 
         self.train_steps = 0
         self.epoch = 0
@@ -431,9 +432,7 @@ class PytorchTrainer:
 
         If metrics are better, update best_val, best_epoch and save
         """
-        val_metric = self.metrics_handler.get_validation_metric()
-        if not val_metric:
-            return  # FIXME: Warning rather than nothing
+        val_metric = cast("metric.Metric", self.metrics_handler.get_validation_metric())
 
         self.val = metrics[val_metric.display_name]
 
