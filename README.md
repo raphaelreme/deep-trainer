@@ -1,7 +1,11 @@
 # Deep-Trainer
 
-[![Lint and
-Test](https://github.com/raphaelreme/deep-trainer/actions/workflows/tests.yml/badge.svg)](https://github.com/raphaelreme/deep-trainer/actions/workflows/tests.yml)
+[![License](https://img.shields.io/github/license/raphaelreme/deep-trainer)](https://github.com/raphaelreme/deep-trainer/raw/main/LICENSE)
+[![PyPi](https://img.shields.io/pypi/v/deep-trainer)](https://pypi.org/project/deep-trainer)
+[![Python](https://img.shields.io/pypi/pyversions/deep-trainer)](https://pypi.org/project/deep-trainer)
+[![Downloads](https://img.shields.io/pypi/dm/deep-trainer)](https://pypi.org/project/deep-trainer)
+[![Codecov](https://codecov.io/github/raphaelreme/deep-trainer/graph/badge.svg)](https://codecov.io/github/raphaelreme/deep-trainer)
+[![Lint and Test](https://github.com/raphaelreme/deep-trainer/actions/workflows/tests.yml/badge.svg)](https://github.com/raphaelreme/deep-trainer/actions/workflows/tests.yml)
 
 Lightweight training utilities for PyTorch projects.
 
